@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { generateAgenda, prepare, validateAgenda, type Message, type Point, type Agenda } from '../src/agenda/index';
 import { agendaDocsInput } from '../src/agenda/docs-input';
 import { renderTemplate } from '../src/template';
+import { agendaParts, agendaTextRequests } from '../src/debug-agenda';
 
 const message = (overrides: Partial<Message> = {}): Message => ({ guild_id: '100', channel_id: '200', message_id: '300',
   created_at: '2026-09-14T01:00:00Z', content: '試験を完了。次回は結果を比較したい。', department: '開発',
@@ -65,7 +66,7 @@ test('Responses request separates source data, sends no storage paths, and retur
     return response();
   }));
   assert.equal(calls, 1);
-  assert.deepEqual(result.markdown.match(/^## .+$/gm), ['## 1. 今週のまとめ', '## 2. 部門・テーマごとの進捗', '## 3. 今日話し合うこと']);
+  assert.deepEqual(result.markdown.match(/^## .+$/gm), ['## 1. 今週の要点', '## 2. 部門・テーマ別の進捗', '## 3. 今日話し合うこと']);
   assert.match(result.markdown, /https:\/\/discord.com\/channels\/100\/200\/300/);
   assert.equal(result.media['400'].imageReviewed, false);
   assert.ok(result.markdown.indexOf('試験を完了した') < result.markdown.indexOf('添付：'));
@@ -82,7 +83,34 @@ test('explicit image data is sent, private URLs are never fetched', async () => 
 });
 test('empty data produces no API calls', async () => {
   const result = await generateAgenda(input([]), options(() => assert.fail('unexpected request')));
-  assert.equal(result.metadata.requestCount, 0); assert.match(result.markdown, /対象ログ内に報告なし/);
+  assert.equal(result.metadata.requestCount, 0); assert.ok(result.notes.includes('対象ログ内に報告なし'));
+});
+
+test('new template preserves evidence and decisions while omitting empty fields and generation notes in both outputs', async () => {
+  const a = agenda();
+  a.summary = [point({text:'成果：荷重20 Nで試験を完了した。'})];
+  a.topics[0].blockers = [point({text:'追加試験の要否を確認する。→ 議題①'})];
+  a.discussions = [{title:'追加試験を実施するか',question:[point({text:'追加試験の実施要否を決める。'})],
+    background:[point({text:'開発・試験の結果を参照。'})],options:[point({text:'投稿者の案は同条件での再試験。'})],
+    people:[point({text:'@開発'})],deadline:[],materials:[]}];
+  const result = await generateAgenda({...input(),coverageNotes:['生成内部メモ']},options(async()=>response(a)));
+  assert.equal(result.templateVersion,'weekly-agenda-v2');
+  const md = result.markdown;
+  assert.match(md,/開催日時：2026-09-15 18:00 JST/);
+  assert.match(md,/- \*\*成果：\*\* 荷重20 N/);
+  assert.match(md,/### 議題① 追加試験を実施するか/);
+  assert.equal(md.match(/\*\*判断材料：\*\*/g)?.length,1);
+  assert.match(md,/\*\*関係者：\*\* @開発/);
+  const parts=agendaParts(result,[]), written=parts.map(p=>p.value).join('');
+  for (const body of [md,written]) {
+    for (const unwanted of ['生成内部メモ','対象ログ内に記載なし','不足情報：','判断期限：','予定 → 現状：','生成用ルール']) assert.ok(!body.includes(unwanted),unwanted);
+    assert.ok(body.includes('→ 議題①'));
+    assert.ok(body.includes('https://discord.com/channels/100/200/300'));
+    assert.ok(body.includes('荷重20 N'));
+  }
+  const styled=agendaTextRequests('- 成果：荷重20 N\n関係者：@開発／判断期限：要確認\n','t.agenda',42);
+  const bold=styled.requests.flatMap((r:any)=>r.updateTextStyle?.textStyle.bold?[r.updateTextStyle.range]:[]);
+  assert.deepEqual(bold.map((r:any)=>styled.text.slice(r.startIndex-42,r.endIndex-42)),['成果：','関係者：','判断期限：']);
 });
 test('provider failures are bounded and do not echo secret bodies', async () => {
   await assert.rejects(generateAgenda(input(), options(async () => new Response(null, { status: 302, headers: { Location: 'https://example.com' } }))), /OPENAI_HTTP_302/);
@@ -90,6 +118,16 @@ test('provider failures are bounded and do not echo secret bodies', async () => 
   await assert.rejects(generateAgenda(input(), options(async () => response(agenda(), { status: 'incomplete' }))), /OPENAI_INCOMPLETE/);
   await assert.rejects(generateAgenda(input(), options(async () => response(agenda(), { output: [{ type: 'message', content: [{ type: 'refusal', refusal: 'no' }] }] }))), /OPENAI_REFUSAL/);
   await assert.rejects(generateAgenda(input(), options(async () => { throw new Error('secret'); })), /OPENAI_NETWORK_ERROR/);
+});
+
+test('duplicate citations are normalized but absent or invented evidence is still rejected', async () => {
+  const a=agenda();a.summary[0].sourceIds=['300','300'];
+  const result=await generateAgenda(input(),options(async()=>response(a)));
+  assert.deepEqual(result.agenda.summary[0].sourceIds,['300']);
+  a.summary[0].sourceIds=[];
+  await assert.rejects(generateAgenda(input(),options(async()=>response(a))),/UNSUPPORTED_POINT/);
+  a.summary[0].sourceIds=['999'];
+  await assert.rejects(generateAgenda(input(),options(async()=>response(a))),/UNKNOWN_SOURCE/);
 });
 test('request limit rejects large workloads before spending', async () => {
   const messages = Array.from({ length: 4 }, (_, i) => message({ message_id: String(500 + i), attachments: [], content: 'a'.repeat(4000) }));

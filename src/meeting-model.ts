@@ -5,6 +5,7 @@ import type { RemoteMessage } from './cloud/model';
 export interface MeetingInput { id: string; guild: string; user: string; runAt: number; title: string; document: string; meetingAt?: number; channel?: string; mode?: 'debug-agenda'; rangeFrom?: number; rangeTo?: number }
 export type MeetingStatus = 'scheduled' | 'collecting' | 'preparing' | 'generating' | 'adding' | 'writing' | 'summarizing' | 'notifying' | 'notification_failed' | 'notification_review' | 'complete' | 'failed' | 'needs_review' | 'cancelled';
 export interface MeetingState extends MeetingInput {
+  projectName?: string;
   status: MeetingStatus; started?: number; finished?: number; error?: string;
   tabId?: string; url?: string; failures: number; skipped: number; imageFallbacks: number;
   cursorCreated: string; cursorId: string; part: number; textIndex: number;

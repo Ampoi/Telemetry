@@ -1,4 +1,5 @@
-import { generateAgenda, type Message, type Point } from './agenda/index';
+import { generateAgenda, type Message } from './agenda/index';
+import { agendaLayout } from './agenda/layout';
 import { AppError } from './errors';
 import { mediaUrl } from './cloud/media';
 import { docsText, jst, type ImagePart, type MeetingPost, type MeetingState } from './meeting-model';
@@ -62,7 +63,7 @@ export async function createDebugAgenda(posts: MeetingPost[], state: MeetingStat
   if (images.length < candidates.length) notes.push(`画像${candidates.length}件中${images.length}件をAIへ送信。取得不可・形式・サイズ・枚数上限による未確認画像は元投稿リンクで表示します。`);
   // generateAgenda accepts JST dates. The collector already applies the exact
   // rolling window; these enclosing dates cannot admit additional posts.
-  const result = await generateAgenda({ project: 'Discord', meetingAt: `${jst(state.rangeTo!)} JST`,
+  const result = await generateAgenda({ project: state.projectName ?? 'プロジェクト名要確認', meetingAt: state.meetingAt ? `${jst(state.meetingAt)} JST` : '要確認',
     guildId: state.guild, from: jst(state.rangeFrom!).slice(0, 10), to: jst(state.rangeTo! + 86400_000).slice(0, 10),
     messages: agendaMessages(posts, state.guild), images, coverageNotes: notes,
   }, { apiKey, model: DEBUG_MODEL, reasoningEffort: DEBUG_EFFORT, maxRequests: 12 });
@@ -77,11 +78,13 @@ export function agendaParts(result: DebugResult, posts: MeetingPost[]): AgendaPa
   const add = (s: string) => parts.push({ kind: 'markdown', value: s + '\n' });
   const media = new Map(posts.flatMap(p => p.attachments.map(a => [a.id, { channel: p.channel_id, message: p.id, attachment: a.id }] as const)));
   const seen = new Set<string>();
-  function emit(points: Point[], label?: string) {
-    if (!points.length && label) add(`- ${label}：対象ログ内に記載なし`);
-    for (const p of points) {
-      add(`- ${label ? label + '：' : ''}${clean(p.text)}`);
-      for (const id of p.sourceIds) add(result.sources[id].url);
+  add(`# ${clean(result.title)}`);
+  add(`開催日時：${clean(result.meetingAt)}`);
+  for (const block of agendaLayout(result.agenda)) {
+    if ('heading' in block) { add(`${'#'.repeat(block.level)} ${clean(block.heading)}`); continue; }
+    add(`${block.bullet ? '- ' : ''}${block.entries.map(({ label, point }) => `${label ? label + '：' : ''}${clean(point.text)}`).join('／')}`);
+    for (const id of new Set(block.entries.flatMap(e => e.point.sourceIds))) add(result.sources[id].url);
+    for (const { point: p } of block.entries) {
       for (const id of p.mediaIds) {
         const a = result.media[id], ref = media.get(id);
         if (!a || !ref || seen.has(id)) continue;
@@ -93,28 +96,19 @@ export function agendaParts(result: DebugResult, posts: MeetingPost[]): AgendaPa
       }
     }
   }
-  add(`# ${clean(result.title)}`);
-  result.notes.forEach(add);
-  add('## 1. 今週のまとめ'); emit(result.agenda.summary);
-  add('## 2. 部門・テーマごとの進捗');
-  for (const t of result.agenda.topics) {
-    add(`### ${clean(t.department)}・${clean(t.title)}`);
-    emit(t.previous, '前回の予定と進み具合'); emit(t.results, '今週やったこと・結果');
-    emit(t.insights, '分かったこと・考察'); emit(t.blockers, '困っていること'); emit(t.next, '次回までの予定・案');
-  }
-  add('## 3. 今日話し合うこと');
-  for (const d of result.agenda.discussions) {
-    add(`### ${clean(d.title)}`); emit(d.question, '決めたいこと・相談したいこと'); emit(d.background, '背景と現状');
-    emit(d.options, '案・判断材料'); emit(d.people, '相談したい相手'); emit(d.deadline, 'いつまでに必要か'); emit(d.materials, '事前に確認する資料');
-  }
   return parts;
 }
 
-export function agendaTextRequests(markdown: string, tabId: string, index: number) {
+export function agendaTextRequests(markdown: string, tabId: string, index: number): { text: string; requests: Record<string, unknown>[] } {
   const text = compileMarkdown(markdown).text;
   const styles = contentRequests(markdown, tabId).slice(1).map(r => {
     const op = Object.values(r)[0] as { range: { startIndex: number; endIndex: number } };
     op.range.startIndex += index - 1; op.range.endIndex += index - 1; return r;
   });
-  return { text, requests: [...textRequests(text, tabId, index), ...styles] };
+  const labels = /(^|／)(成果|注意点|会議の焦点|予定 → 現状|やったこと・結果|分かったこと・考察|課題|次の予定|今回決めたいこと|判断材料|不足情報|関係者|判断期限)：/gm;
+  const emphasis = [...text.matchAll(labels)].map(m => ({ updateTextStyle: {
+    range: { tabId, startIndex: index + m.index! + m[1].length, endIndex: index + m.index! + m[0].length },
+    textStyle: { bold: true }, fields: 'bold',
+  } }));
+  return { text, requests: [...textRequests(text, tabId, index), ...styles, ...emphasis] };
 }

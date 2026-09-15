@@ -83,7 +83,8 @@ export class MeetingScheduler extends DurableObject<Env> {
     if (![15, 16].includes(c.type)) this.task(`scan:${c.id}`, 'scan', c.id, snowflake(end));
   }
   private async checkManager(state: MeetingState): Promise<void> {
-    const guild = await discord<{ owner_id: string }>(this.env, `/guilds/${state.guild}`);
+    const guild = await discord<{ owner_id: string; name?: string }>(this.env, `/guilds/${state.guild}`);
+    if (guild.name) state.projectName = guild.name;
     if (guild.owner_id === state.user) return;
     const member = await discord<{ roles: string[] }>(this.env, `/guilds/${state.guild}/members/${state.user}`);
     const roles = await discord<{ id: string; permissions: string }[]>(this.env, `/guilds/${state.guild}/roles`);

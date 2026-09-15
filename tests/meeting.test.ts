@@ -97,7 +97,7 @@ before(async()=>{
       }
       if(u.pathname===`/api/v10/channels/${root}`)return MockResponse.json({id:root,guild_id:guild,type:0,name:'一般'});
       if(u.pathname==='/api/v10/applications/@me')return MockResponse.json({flags:contentIntent?1<<19:0});
-      if(u.pathname===`/api/v10/guilds/${guild}`)return MockResponse.json({owner_id:revoked?'999999999999999999':user});
+      if(u.pathname===`/api/v10/guilds/${guild}`)return MockResponse.json({name:'試験サーバー',owner_id:revoked?'999999999999999999':user});
       if(u.pathname===`/api/v10/guilds/${guild}/members/${user}`)return MockResponse.json({roles:[]});
       if(u.pathname===`/api/v10/guilds/${guild}/roles`)return MockResponse.json([{id:guild,permissions:'0'}]);
       if(u.pathname===`/api/v10/guilds/${guild}/channels`)return MockResponse.json([{id:root,name:'一般',type:0,guild_id:guild},{id:forum,name:'フォーラム',type:15,guild_id:guild},{id:hidden,name:'非公開',type:0,guild_id:guild}]);
@@ -276,7 +276,10 @@ test('debug executes the rolling week with Luna medium, reviewed images and no n
   assert.equal(writes.filter(w=>w.requests[0].addDocumentTab).length,1);
   assert.equal(writes.filter(w=>w.requests[0].insertInlineImage).length,1);
   const written=writes.flatMap(w=>w.requests.filter(r=>r.insertText).map(r=>r.insertText.text)).join('');
-  for(const heading of ['1. 今週のまとめ','2. 部門・テーマごとの進捗','3. 今日話し合うこと'])assert.ok(written.includes(heading));
+  for(const heading of ['1. 今週の要点','2. 部門・テーマ別の進捗','3. 今日話し合うこと'])assert.ok(written.includes(heading));
+  assert.ok(written.includes('試験サーバー 週次会議アジェンダ'));
+  assert.ok(written.includes('開催日時：要確認'));
+  assert.ok(!written.includes('対象ログ内に記載なし'));
   assert.ok(!written.includes('##'));assert.ok(writes.some(w=>w.requests.some(r=>r.updateParagraphStyle)));
   const n=replies.length;await signed(payload);await waitReply(n);await harness('step',payload.id);
   assert.equal(summaryInputs.length,1);assert.equal(writes.filter(w=>w.requests[0].addDocumentTab).length,1);

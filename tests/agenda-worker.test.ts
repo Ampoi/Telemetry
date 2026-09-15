@@ -43,6 +43,6 @@ test('agenda consumes actual D1 exportRecord output in Workers without changing 
     assert.equal(calls,1);
     assert.equal(result.media['400'].storage_key,'private-storage/test');
     assert.deepEqual(result.agenda.summary[0].sourceIds,[message.message_id]);
-    assert.match(result.markdown,/今週のまとめ/);
+    assert.match(result.markdown,/今週の要点/);
   } finally { await mf.dispose(); }
 });
