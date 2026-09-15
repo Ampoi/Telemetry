@@ -1,6 +1,5 @@
 import { createLogin } from './auth';
-import { decrypt, encrypt } from './crypto';
-import { createTab } from './documents';
+import { decrypt } from './crypto';
 import { AppError } from './errors';
 import { documentId } from './template';
 import { cloudInteraction } from './cloud/api';
@@ -20,7 +19,8 @@ export interface Interaction {
   user?: { id: string };
   data?: { name: string; options?: { name: string; type: number; value: unknown; options?: { name: string; type: number; value: unknown }[] }[] };
 }
-interface CreateJob { id: string; applicationId: string; token: string; guildId: string; owner: string; document: string; title: string; message: string; createdAt: string; expiresAt: number }
+// Drain jobs queued before /create was removed without creating new tabs.
+interface CreateJob { applicationId: string; token: string; expiresAt: number }
 export interface DiscordJobEnvelope { id: string; encrypted: string }
 export type DiscordQueueJob = DiscordJobEnvelope | ProfileJob;
 
@@ -62,20 +62,20 @@ export async function handleDiscord(request: Request, env: Env, ctx: ExecutionCo
   try { interaction = JSON.parse(raw); } catch { throw new AppError(400, 'Invalid interaction JSON.'); }
   if (!interaction || interaction.application_id !== env.DISCORD_APPLICATION_ID) throw new AppError(401, 'Discord application mismatch.');
   if (interaction.type === 1) return Response.json({ type: 1 });
-  if (interaction.type !== 2) return ephemeral('対応しているコマンドは /auth・/document・/create・/telemetry・/mtg です。');
+  if (interaction.type !== 2) return ephemeral('対応しているコマンドは /auth・/document・/telemetry・/mtg です。');
   const userId = interaction.member?.user?.id ?? interaction.user?.id;
   if (!userId || !/^\d{17,20}$/.test(userId) || !/^\d{17,20}$/.test(interaction.id) || typeof interaction.token !== 'string' || !interaction.token) throw new AppError(400, 'Discord user or interaction missing.');
   try {
     if (interaction.data?.name === 'mtg') return await meetingInteraction(interaction, env, ctx);
     if (interaction.data?.name === 'telemetry') return await (env.COLLECTION_MODE === 'cloud' ? cloudInteraction(interaction, env, ctx) : acceptCollector(interaction, env));
-    if (!['auth', 'document', 'create'].includes(interaction.data?.name ?? '')) return ephemeral('対応しているコマンドは /auth・/document・/create・/telemetry です。');
+    if (!['auth', 'document'].includes(interaction.data?.name ?? '')) return ephemeral('対応しているコマンドは /auth・/document・/telemetry・/mtg です。');
     const guildId = requireGuildManager(interaction);
     const owner = guildOwner(guildId);
     if (interaction.data?.name === 'auth') {
       const login = await createLogin(env, owner);
       refreshProfile(env, ctx, guildId);
       return Response.json({ type: 4, data: {
-        content: `このサーバー（ID: ${guildId}）専用のGoogle接続です。接続したアカウントは、このサーバーの管理者による /create に使用されます。接続メールアドレスと保存先URLは、このサーバーのBotプロフィールに表示されます。下のボタンから編集を許可してください（10分間有効）。このリンクは他の人に渡さないでください。`,
+        content: `このサーバー（ID: ${guildId}）専用のGoogle接続です。接続したアカウントは、このサーバーのMTG記録作成 に使用されます。接続メールアドレスと保存先URLは、このサーバーのBotプロフィールに表示されます。下のボタンから編集を許可してください（10分間有効）。このリンクは他の人に渡さないでください。`,
         flags: 64, allowed_mentions: { parse: [] },
         components: [{ type: 1, components: [{ type: 2, style: 5, label: 'Googleアカウントを接続', url: login.url }] }],
       } });
@@ -95,36 +95,13 @@ export async function handleDiscord(request: Request, env: Env, ctx: ExecutionCo
         await env.DB.prepare('INSERT INTO discord_guild_settings (guild_id, document_id, updated_by, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(guild_id) DO UPDATE SET document_id = excluded.document_id, updated_by = excluded.updated_by, updated_at = excluded.updated_at')
           .bind(guildId, id, userId, Date.now()).run();
         refreshProfile(env, ctx, guildId);
-        return ephemeral(`このサーバーの保存先を設定しました。\nhttps://docs.google.com/document/d/${id}/edit\n/auth で接続後、/create でタブを作成できます。`);
+        return ephemeral(`このサーバーの保存先を設定しました。\nhttps://docs.google.com/document/d/${id}/edit\n/auth で接続後、/mtg schedule で日程調整を開始できます。`);
       }
       const profile = await connectionProfile(env, guildId);
       refreshProfile(env, ctx, guildId);
       return ephemeral(`このサーバーの保存先: ${profile.documentUrl ?? '未設定（/document document:URL で設定）'}\nGoogle接続: ${profile.connected ? `登録済み（有効性は作成時に確認）\nメール: ${profile.email ?? '未取得（/auth で再接続）'}` : '未接続（/auth で接続）'}`);
     }
-    const settings = specifiedDocument ? null : await env.DB.prepare('SELECT document_id FROM discord_guild_settings WHERE guild_id = ?').bind(guildId).first<{ document_id: string }>();
-    const targetDocument = specifiedDocument || settings?.document_id;
-    if (!targetDocument) throw new AppError(400, 'このサーバーの保存先が未設定です。/document document:URL で設定するか、/create document:URL を指定してください。');
-    // Snowflake time is stable across redelivery of the same interaction.
-    const createdAt = new Date(Number((BigInt(interaction.id) >> 22n) + 1420070400000n)).toISOString();
-    const title = option('title', `デバッグ ${createdAt}`);
-    const message = option('message', 'Discordの /create から作成しました。');
-    if (!title.trim() || title.length > 100 || /[\u0000-\u001f]/.test(title)) throw new AppError(400, 'タブ名は改行なしの1〜100文字にしてください。');
-    if (message.length > 1000) throw new AppError(400, 'メモは1,000文字以内にしてください。');
-    const job: CreateJob = { id: interaction.id, applicationId: interaction.application_id, token: interaction.token, guildId, owner,
-      document: documentId(targetDocument), title, message, createdAt, expiresAt: new Date(createdAt).getTime() + 14 * 60_000 };
-    if (job.expiresAt <= Date.now()) return ephemeral('コマンドの有効時間を過ぎています。/create を再実行してください。');
-    // Only queue publishing runs after the response; Google work runs in the queue consumer.
-    ctx.waitUntil((async () => {
-      try {
-        const encrypted = await encrypt(JSON.stringify(job), env.TOKEN_ENCRYPTION_KEY, `discord-job:${job.id}`);
-        await env.DISCORD_JOBS.send({ id: job.id, encrypted });
-      } catch {
-        await editReply(job, '作成処理を受け付けられませんでした。少し待って /create を再実行してください。').catch(() => {
-          console.error(JSON.stringify({ event: 'discord_enqueue_failed', interactionId: job.id }));
-        });
-      }
-    })());
-    return Response.json({ type: 5, data: { flags: 64 } });
+    return ephemeral('対応しているコマンドは /auth・/document・/telemetry・/mtg です。');
   } catch (error) {
     return ephemeral(error instanceof AppError ? error.message : '設定を確認してください。Google OAuth・D1・Discordの設定が必要です。');
   }
@@ -150,27 +127,7 @@ export async function consumeDiscordJobs(batch: MessageBatch<DiscordQueueJob>, e
       const envelope = queued.body as DiscordJobEnvelope;
       const job = JSON.parse(await decrypt(envelope.encrypted, env.TOKEN_ENCRYPTION_KEY, `discord-job:${envelope.id}`)) as CreateJob;
       if (job.expiresAt <= Date.now()) { queued.ack(); continue; }
-      // Pre-migration jobs have personal credentials and no server context.
-      if (!/^\d{17,20}$/.test(job.guildId ?? '') || job.owner !== guildOwner(job.guildId)) {
-        await editReply(job, 'サーバー別Google連携への切り替えにより、この作成処理を停止しました。サーバー内で /auth と /create を再実行してください。');
-        queued.ack(); continue;
-      }
-      const request = new Request('https://internal.invalid/create', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ document: job.document, title: job.title,
-          template: '# デバッグ記録\n\n作成日時: {{createdAt}}\n実行ID: {{runId}}\n\n## メモ\n{{message}}\n',
-          data: { createdAt: job.createdAt, runId: job.id, message: job.message }, requestId: job.id }),
-      });
-      let content: string;
-      try {
-        const result = await (await createTab(request, env, job.owner)).json<{ url: string }>();
-        content = `タブを作成してデバッグ内容を入力しました。\n${result.url}`;
-      } catch (error) {
-        const url = error instanceof AppError ? error.details?.url ?? (error.details?.previousResult as { url?: string } | undefined)?.url : undefined;
-        content = `${error instanceof AppError ? error.message : '処理が中断しました。ドキュメントを確認してください。'}${url ? `\n${url}` : ''}`;
-      }
-      // Retrying a failed Discord delivery reuses the interaction ID; no duplicate Google writes.
-      await editReply(job, content);
+      await editReply(job, '/create は廃止されました。MTGの日程調整は /mtg schedule を使用してください。');
       queued.ack();
     } catch {
       console.error(JSON.stringify({ event: 'discord_job_delivery_failed', interactionId: queued.body.id }));

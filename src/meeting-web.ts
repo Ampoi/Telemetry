@@ -91,7 +91,7 @@ export async function meetingWeb(request: Request, env: MeetingWebEnv): Promise<
     await env.DB.prepare('DELETE FROM meeting_sessions WHERE token_hash=?').bind(await hash(cookie(request, 'mtg_session'))).run();
     return Response.json({ ok: true }, { headers: { 'Set-Cookie': setCookie(env, 'mtg_session', '', 0) } });
   }
-  const match = url.pathname.match(/^\/mtg\/polls\/(\d{17,20})(?:\/(data|configure|answer|cancel))?$/);
+  const match = url.pathname.match(/^\/mtg\/polls\/(\d{17,20})(?:\/(data|answer|cancel))?$/);
   if (!match) throw new AppError(404, 'ページが見つかりません。');
   const row = await poll(env, match[1]);
   if (!match[2] && request.method === 'GET') return meetingPage(row.id);
@@ -101,23 +101,13 @@ export async function meetingWeb(request: Request, env: MeetingWebEnv): Promise<
   const stub = env.MEETING_POLLS.getByName(row.id);
   try {
     if (match[2] === 'data' && request.method === 'GET') {
-      const view = await stub.view(current.user);
+      const view = await stub.open(current.user);
       if (view.status === 'confirmed') {
         const reservation = await env.MEETINGS.getByName(`${row.guild}:${row.id}`).summary();
         if (reservation?.status === 'cancelled') view.status = 'cancelled';
         else if (!view.notified && !view.error) view.error = 'Discordへの確定通知は完了未確認です。チャンネルの表示をご確認ください。';
       }
       return Response.json({ ...view, name: current.name });
-    }
-    if (match[2] === 'configure' && request.method === 'POST') {
-      await manager(env, row, current.user);
-      const data = await jsonBody(request);
-      if (!Array.isArray(data.members) || data.members.length > 49) throw new AppError(400, '参加者を49名以内で指定してください（主催者は自動参加）。');
-      const ids = [...new Set([current.user, ...data.members.map(discordId)])];
-      const members = [];
-      for (const id of ids) { const m = await member(env, row.guild, id); members.push({ id, name: m.nick ?? m.user.global_name ?? m.user.username }); }
-      if (typeof data.duration !== 'number' || typeof data.title !== 'string') throw new AppError(400, '所要時間とタイトルを指定してください。');
-      return Response.json(await stub.configure(current.user, members, data.duration, data.title));
     }
     if (match[2] === 'answer' && request.method === 'POST') {
       const data = await jsonBody(request);
@@ -128,9 +118,10 @@ export async function meetingWeb(request: Request, env: MeetingWebEnv): Promise<
   } catch (error) {
     if (error instanceof AppError) throw error;
     const message = error instanceof Error ? error.message : '';
-    if (message.includes('PollForbidden')) throw new AppError(403, 'この日程調整の参加者ではありません。主催者に参加者の設定を確認してください。');
+    if (message.includes('MemberList')) throw new AppError(503, message.includes('MemberListForbidden') ? 'メンバーを取得できません。サーバー管理者にBotのServer Members Intent設定を確認してもらってください。' : 'メンバーを取得できませんでした。少し待ってページを更新してください。');
+    if (message.includes('PollForbidden')) throw new AppError(403, 'この日程調整の参加者ではありません。サーバーの所属を確認してください。');
     if (/PollClosed|PollExpired/.test(message)) throw new AppError(409, '募集を終了しています。ページを更新してください。');
-    if (/Invalid/.test(message)) throw new AppError(400, '参加者は主催者を含む2〜50名、所要時間は30〜120分、タイトルは1〜100文字で指定してください。');
+    if (/Invalid/.test(message)) throw new AppError(400, '入力内容を確認して、もう一度お試しください。');
     throw error;
   }
   throw new AppError(405, 'この操作には対応していません。');

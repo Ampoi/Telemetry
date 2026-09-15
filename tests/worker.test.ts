@@ -2,7 +2,8 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { Miniflare, convertV4MiniflareOptions, Response as MockResponse } from 'miniflare';
-import { decrypt, encrypt, hash } from '../src/crypto';
+import { decrypt, hash } from '../src/crypto';
+import { discordCommands } from '../src/discord-commands';
 import { generateKeyPairSync, sign } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 
@@ -302,14 +303,14 @@ test('Worker上でOAuth・書き込み・失敗時の重複防止を検証', asy
     assert.equal((await discordRequest({ ...discordPayload('auth'), application_id: 'another-app' })).status, 401);
   });
   const options = [{ name: 'document', type: 3, value: document }];
-  await t.test('未認証の/createは本人限定で/authを案内し、Googleへ書き込まない', async () => {
-    const payload = discordPayload('create', discordUserA, options);
+  await t.test('廃止した/createは登録せず、古いInteractionでもGoogleへ書き込まない', async () => {
+    assert.ok(!discordCommands.some(command => command.name === 'create'));
     const before = writes.length;
-    const deferred = await discordRequest(payload);
-    assert.deepEqual(await deferred.json(), { type: 5, data: { flags: 64 } });
-    const reply = await awaitReply(payload.token);
-    assert.match(reply.content, /\/auth/);
-    assert.deepEqual(reply.allowed_mentions.parse, []);
+    const body = await (await discordRequest(discordPayload('create', discordUserA, options))).json() as { type: number; data: { flags: number; content: string; allowed_mentions: { parse: string[] } } };
+    assert.equal(body.type, 4);
+    assert.equal(body.data.flags, 64);
+    assert.doesNotMatch(body.data.content, /\/create/);
+    assert.deepEqual(body.data.allowed_mentions.parse, []);
     assert.equal(writes.length, before);
   });
   await t.test('/authはサーバーごとにGoogleを接続しCLI認証と分離する', async () => {
@@ -323,54 +324,25 @@ test('Worker上でOAuth・書き込み・失敗時の重複防止を検証', asy
     await api('/api/auth', 'DELETE');
     assert.ok(await db.prepare('SELECT id FROM credentials WHERE id = ?').bind(`discord:guild:${discordGuildA}`).first());
   });
-  await t.test('/createはキュー経由で新規タブへ入力し、再配信で重複を作らない', async () => {
-    const payload = discordPayload('create', discordUserA, [...options, { name: 'message', type: 3, value: 'Discordテスト 🚀' }]);
-    const before = writes.length;
-    assert.deepEqual(await (await discordRequest(payload)).json(), { type: 5, data: { flags: 64 } });
-    assert.match((await awaitReply(payload.token)).content, /tab=t.created/);
-    assert.equal(writes.length, before + 2);
-    assert.ok(JSON.stringify(writes.at(-1)).includes('Discordテスト 🚀'));
-    await discordRequest(payload);
-    await awaitReply(payload.token, 2);
-    assert.equal(writes.length, before + 2);
-    const second = discordPayload('create', discordUserA, options, discordGuildB);
-    await discordRequest(second);
-    assert.match((await awaitReply(second.token)).content, /未接続/);
-    assert.equal(writes.length, before + 2);
-  });
+
   await t.test('同じユーザーが別サーバーを認証しても元サーバーのGoogleトークンは変わらない', async () => {
+    const db = await mf.getD1Database('DB');
+    const before = await db.prepare('SELECT * FROM credentials WHERE id = ?').bind(`discord:guild:${discordGuildA}`).first();
     await discordLogin(discordUserA, 'test-code-b', discordGuildB);
-    const b = discordPayload('create', discordUserA, options, discordGuildB);
-    await discordRequest(b);
-    await awaitReply(b.token);
-    assert.equal(docAccessTokens.at(-1), 'Bearer test-access-b');
-    const a = discordPayload('create', discordUserA, options);
-    await discordRequest(a);
-    await awaitReply(a.token);
-    assert.equal(docAccessTokens.at(-1), 'Bearer test-access');
+    assert.deepEqual(await db.prepare('SELECT * FROM credentials WHERE id = ?').bind(`discord:guild:${discordGuildA}`).first(), before);
+    const row = await db.prepare('SELECT encrypted_refresh_token FROM credentials WHERE id = ?').bind(`discord:guild:${discordGuildB}`).first<{ encrypted_refresh_token: string }>();
+    assert.equal(await decrypt(row!.encrypted_refresh_token, Buffer.alloc(32, 1).toString('base64url'), `discord:guild:${discordGuildB}`), 'test-refresh-b');
   });
-  await t.test('/createの入力不正と本文入力失敗を本人に通知する', async () => {
-    const invalid = await discordRequest(discordPayload('create', discordUserA));
-    const body = await invalid.json() as { type: number; data: { flags: number } };
-    assert.equal(body.type, 4);
-    assert.equal(body.data.flags, 64);
-    rejectContent = true;
-    const failed = discordPayload('create', discordUserA, options);
-    await discordRequest(failed);
-    const reply = await awaitReply(failed.token);
-    assert.match(reply.content, /タブは作成済み/);
-    assert.match(reply.content, /tab=t.created/);
-    rejectContent = false;
-  });
+
 });
 
 test('サーバー設定・認証の境界を検証する', async t => {
   const db = await mf.getD1Database('DB');
   const key = Buffer.alloc(32, 1).toString('base64url');
-  await t.test('DM・不正guild・権限なしでは認証・設定・作成を受け付けない', async () => {
+  await t.test('DM・不正guild・権限なしでは認証・設定を受け付けない', async () => {
     const beforeWrites = writes.length;
     const beforeRequests = await db.prepare('SELECT COUNT(*) AS count FROM auth_requests').first();
-    for (const command of ['auth', 'document', 'create']) {
+    for (const command of ['auth', 'document']) {
       const payload = discordPayload(command, discordUserA, [{ name: 'document', type: 3, value: document }]);
       for (const invalid of [
         { ...payload, guild_id: undefined, member: undefined, user: { id: discordUserA } },
@@ -411,42 +383,13 @@ test('サーバー設定・認証の境界を検証する', async t => {
       assert.match(response.data.content, /登録済み/);
     }
   });
-  await t.test('URL省略時に各サーバーのURLと認証を使い、管理者間で接続を共用する', async () => {
-    for (const [guild, id, token] of [[discordGuildA, document, 'Bearer test-access'], [discordGuildB, documentB, 'Bearer test-access-b']]) {
-      const payload = discordPayload('create', discordUserB, [], guild);
-      const before = writes.length;
-      assert.deepEqual(await (await discordRequest(payload)).json(), { type: 5, data: { flags: 64 } });
-      assert.match((await awaitReply(payload.token)).content, /タブを作成/);
-      assert.equal(writes.length, before + 2);
-      assert.deepEqual(docWritePaths.slice(-2), Array(2).fill(`/v1/documents/${id}:batchUpdate`));
-      assert.deepEqual(docAccessTokens.slice(-2), Array(2).fill(token));
-      assert.ok(await db.prepare('SELECT id FROM operations WHERE id = ?').bind(`discord:guild:${guild}:${payload.id}`).first());
-      await discordRequest(payload);
-      await awaitReply(payload.token, 2);
-      assert.equal(writes.length, before + 2);
-    }
-  });
-  await t.test('今回だけのURL指定はサーバー設定を上書きしない', async () => {
-    const payload = discordPayload('create', discordUserA, [{ name: 'document', type: 3, value: documentB }]);
-    await discordRequest(payload);
-    assert.match((await awaitReply(payload.token)).content, /タブを作成/);
-    assert.equal(docWritePaths.at(-1), `/v1/documents/${documentB}:batchUpdate`);
-    assert.equal(docAccessTokens.at(-1), 'Bearer test-access');
-    assert.equal((await db.prepare('SELECT document_id FROM discord_guild_settings WHERE guild_id = ?').bind(discordGuildA).first())?.document_id, document);
-  });
-  await t.test('未設定サーバーは他サーバーのURL・認証や旧個人認証を使わない', async () => {
-    const guild = '678901234567890123';
-    const before = writes.length;
-    const missing = await (await discordRequest(discordPayload('create', discordUserA, [], guild))).json() as { type: number; data: { content: string } };
-    assert.equal(missing.type, 4);
-    assert.match(missing.data.content, /未設定/);
-    const legacyOwner = `discord:${discordUserA}`;
-    await db.prepare('INSERT INTO credentials (id, encrypted_refresh_token, connected_at) VALUES (?, ?, ?)')
-      .bind(legacyOwner, await encrypt('test-refresh', key, legacyOwner), Date.now()).run();
-    const payload = discordPayload('create', discordUserA, [{ name: 'document', type: 3, value: document }], guild);
-    await discordRequest(payload);
-    assert.match((await awaitReply(payload.token)).content, /未接続/);
-    assert.equal(writes.length, before);
+
+
+  await t.test('未設定サーバーは他サーバーのURL・認証を表示しない', async () => {
+    const body = await (await discordRequest(discordPayload('document', discordUserA, [], '678901234567890123'))).json() as { data: { content: string } };
+    assert.match(body.data.content, /未設定/);
+    assert.match(body.data.content, /未接続/);
+    assert.ok(!body.data.content.includes(document));
   });
   await t.test('暗号化トークンを別サーバーの所有者として復号できない', async () => {
     const owner = `discord:guild:${discordGuildA}`;
@@ -460,10 +403,9 @@ test('サーバー設定・認証の境界を検証する', async t => {
     const login = await discordLogin(discordUserB, 'test-code-b');
     assert.equal((await mf.dispatchFetch(`http://localhost:8787/auth/callback?state=${login.state}&code=test-code`, { headers: { Cookie: login.cookie } })).status, 400);
     assert.deepEqual(await db.prepare('SELECT * FROM credentials WHERE id = ?').bind(`discord:guild:${discordGuildB}`).first(), otherBefore);
-    const payload = discordPayload('create');
-    await discordRequest(payload);
-    await awaitReply(payload.token);
-    assert.equal(docAccessTokens.at(-1), 'Bearer test-access-b');
+    const owner = `discord:guild:${discordGuildA}`;
+    const row = await db.prepare('SELECT encrypted_refresh_token FROM credentials WHERE id = ?').bind(owner).first<{ encrypted_refresh_token: string }>();
+    assert.equal(await decrypt(row!.encrypted_refresh_token, key, owner), 'test-refresh-b');
   });
   await t.test('キャンセルしてもサーバーの既存接続を変更しない', async () => {
     const before = await db.prepare('SELECT * FROM credentials ORDER BY id').all();

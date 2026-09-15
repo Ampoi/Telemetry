@@ -8,9 +8,8 @@ Gatewayイベントを使う従来のNode.js collectorも `collector/` に用意
 
 - `/auth`：サーバー単位のGoogle OAuth（PKCE、使い捨てstate、暗号化refresh token）。
 - `/document`：既存Google Docsの保存先設定。
-- `/create`：新しいタブにテンプレートを書き込み。Queue再配信・同時再送の二重作成を防止。
 - `/telemetry status` / `/telemetry backfill days:30`：管理者限定の収集状況・履歴取得。
-- `/mtg schedule` / `status` / `cancel`：日本時間の日時を予約し、サーバー内の取得可能な全履歴を収集して1つのDocsタブへ記録。
+- `/mtg schedule` / `status` / `cancel`：Webで空き時間を調整して日時を自動確定し、サーバー内の取得可能な全履歴を収集して1つのDocsタブへ記録。
 - `/mtg debug`：直近168時間を即時収集し、Luna・mediumで3部構成のアジェンダを生成してDocsへ出力。日程調整と全員通知は行いません。詳細は [アジェンダの手順](docs/agenda.md)。
 - Workers版の手動収集：REST取得、スレッド探索、D1投稿保存、R2画像・動画保存、JST期間指定JSONL。Cronによる定期収集は廃止しています。
 - ローカル版：Gatewayの投稿・編集・単独/一括削除、SQLite、ローカル添付保存。
@@ -47,21 +46,36 @@ DiscordのInteractionsには公開HTTPS URLが必要です。ローカル動作�
 /mtg cancel id:予約ID
 ```
 
-- `/mtg schedule` は引数なし。本人限定の返信の「日程調整を開く」ボタンからWebへ進みます。
-- Discordログイン後、主催者が他の参加者のユーザーID・メンション、タイトル、所要時間（30・60・90・120分、既定60分）を指定して募集を開始。主催者を含む2〜50人の同一サーバーのメンバーが対象です。Botは除外し、参加者は募集開始後に固定します。
+- `/mtg schedule` は引数なし。実行チャンネルに `@everyone` 付きの「次回MTGの日時を入力してください！」と「日程調整を開く」ボタンを投稿します。Botに投稿・全員メンション権限が必要です。成功時の本人限定返信は残しません。
+- Discordログイン後は直接、空き時間を入力します。最初にページを開いた時点のサーバー全メンバー（Botを除く）を自動で対象にし、募集終了まで固定します。参加者・所要時間・名前の設定は不要。名前は確定した開催日のJST日付で `2026/09/14 定例mtg` の形式にします。
+- メンバーの自動取得には、Discord Developer Portal → Bot → Privileged Gateway Intents の **Server Members Intent** が必要です（Application ID: `1548735050646949999`）。OAuthスコープ・招待権限は変更ありません。
 - 作成日のJST日付から5〜9日後（7日後の前後2日、合計5日間）の0:00〜24:00を表示。30分単位でクリック・ドラッグ、またはTabとSpaceで空き時間を選択し保存します。招待リンクをコピーして参加者に共有してください。
-- 全員が回答し、所要時間の連続した共通枠ができたら自動確定。未回答を空き扱いしません。空き時間なしの回答も保存でき、共通枠がなければ修正して調整を続けます。
+- 全員が回答し、共通の開始時刻ができたら自動確定。未回答を空き扱いしません。空き時間なしの回答も保存でき、共通枠がなければ修正して調整を続けます。
 - 複数候補は7日後に近い日、同距離なら早い日、その日の早い時刻を優先。日付をまたぐ枠、確定時点から1時間以内の枠を除外します。確定後の回答変更はできません。
 - 確定日時を元チャンネルへメンションなしで通知し、既存の資料作成予約へ接続します。通知失敗でも予約は維持。結果が不明な通知は自動再送せずWebに確認案内を表示します。
 - `/mtg status` は募集状況・リンクと確定済み予約を表示。募集は主催者が `/mtg cancel id:調整ID` で取り消せます。候補期間を過ぎた募集は終了します。
 
+#### Botの招待権限
+
+[必要な権限を含めてBotを招待・再認可する](https://discord.com/oauth2/authorize?client_id=1548735050646949999&scope=bot%20applications.commands&permissions=274878106624)
+
+チャンネル閲覧・履歴閲覧・メッセージ送信・スレッド内送信・全員メンションを要求します。MTG募集の `@everyone` 通知には全員メンション権限が必要です。チャンネル個別の権限で拒否されている場合は、通知先でその設定も変更してください。管理者権限は要求しません。権限やスコープを変更した場合は、新しい招待URLをユーザーへ案内します。
+
 #### 日程調整のDiscordログイン設定
 
 1. Discord Developer Portal → OAuth2 → Redirectsに `APP_ORIGIN + /mtg/login/callback` を登録（本番: `https://telemetry.tange-toshihiro.workers.dev/mtg/login/callback`）。
-2. OAuth2 Client Secretを `pnpm exec wrangler secret put DISCORD_CLIENT_SECRET` で登録します。Bot Tokenとは別の値です。ローカルは `.dev.vars` に設定します。
+2. 対象アプリ（本番Application ID: `1548735050646949999`）のOAuth2 Client Secretを、プロジェクトのルートで次のコマンドを実行して登録します。`DISCORD_CLIENT_SECRET` は設定名なので、そのまま入力してください。秘密値はコマンドの引数にせず、実行後の入力欄へ貼り付けます。Bot Tokenとは別の値です。
+
+   ```sh
+   pnpm exec wrangler secret put DISCORD_CLIENT_SECRET --name telemetry
+   ```
+
+   成功メッセージを確認後、`pnpm exec wrangler secret list --name telemetry` の一覧に `DISCORD_CLIENT_SECRET` があることを確認します。`secret put` は本番へ即時反映されます。ローカルは `.dev.vars` に同名で設定します。このSecretは `wrangler.jsonc` の必須設定にも含め、未登録でのデプロイを防ぎます。
+
+   秘密値を誤って設定名にした場合は、Discord Developer PortalでClient Secretを再発行してから登録し直してください。秘密値をチャットやコマンド引数へ貼り付けないでください。
 3. 追加D1マイグレーション `0009` の適用、Workerデプロイ（新しいMeetingPoll Durable Objectを含む）、Discordコマンド定義の更新が必要です。既存予約は保持されます。
 
-認証スコープは `identify` のみ。stateをブラウザCookieに結び付けて使い捨てにします。セッションCookieはHttpOnly・SameSite=Lax・本番Secure、24時間有効。D1にはセッショントークンのハッシュを保存し、Discord access/refresh tokenは保存しません。APIで現在のサーバー所属を確認し、参加者だけが閲覧、本人だけが回答を変更できます。変更APIは同一Originを要求し、主催者の設定・取消時に管理権限を再確認します。
+認証スコープは `identify` のみ。stateをブラウザCookieに結び付けて使い捨てにします。セッションCookieはHttpOnly・SameSite=Lax・本番Secure、24時間有効。D1にはセッショントークンのハッシュを保存し、Discord access/refresh tokenは保存しません。APIで現在のサーバー所属を確認し、参加者だけが閲覧、本人だけが回答を変更できます。変更APIは同一Originを要求し、主催者の取消時に管理権限を再確認します。
 
 #### 日時確定後の資料作成
 
@@ -191,7 +205,7 @@ Workers完結版はこのpollを使用しません。
 R2の公開URL・カスタムドメインは無効で、不完全multipart uploadは7日後に自動削除します。
 以下の作成コマンドで既存のD1・Queue・R2を重複作成しないでください。
 
-Discordアプリ `1548735050646949999` のInteractions EndpointはこのWorkerの `/discord/interactions` に切替済みです。`/auth`・`/document`・`/create`・`/telemetry`・`/mtg` をグローバル登録し、Message Content Intentを有効化しました。
+Discordアプリ `1548735050646949999` のInteractions EndpointはこのWorkerの `/discord/interactions` に切替済みです。`/auth`・`/document`・`/telemetry`・`/mtg` をグローバル登録し、Message Content Intentを有効化しました。
 Google OAuthクライアントの承認済みリダイレクトURIに `https://telemetry.tange-toshihiro.workers.dev/auth/callback` を2026-09-15に追加しました。旧デモURLだけが登録されていたため発生していた `redirect_uri_mismatch` が解消し、公開Workerの認証開始からGoogleログイン画面へ進むことを確認済みです。実アカウントでの同意・コールバック完了は別途確認が必要です。
 新規D1のためGoogle接続・保存先Docs・収集対象チャンネルは別途設定してください。旧デモの接続・収集データは移行していません。
 本番へのリソース作成・デプロイ・Discord登録は以下の手順で明示実行します。
@@ -221,7 +235,7 @@ pnpm run discord:register
 
 DiscordのInteractions Endpointを `APP_ORIGIN/discord/interactions` に設定します。
 コマンド登録スクリプトは名前ごとに登録・更新し、他のコマンドを一括削除しません。
-サーバー内で `/auth` → `/document document:URL` → `/create` を実行してください。
+サーバー内で `/auth` → `/document document:URL` → `/mtg schedule` を実行してください。
 手動のクラウド収集は管理CLIでconfigureしたあとscan・backfillから起動します。MTG予約ではBotの閲覧範囲を実行時に探索するためconfigureは不要です。
 
 ## ローカルcollector（代替構成）

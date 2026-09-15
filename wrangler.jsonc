@@ -11,7 +11,7 @@
     "DISCORD_PUBLIC_KEY": "bf03556bc7feeca9922c60e516931f2c1dc4403656074febbe221608c6b64fb7",
     "COLLECTION_MODE": "cloud"
   },
-  "secrets": { "required": ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "DEMO_API_KEY", "TOKEN_ENCRYPTION_KEY", "DISCORD_BOT_TOKEN"] },
+  "secrets": { "required": ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "DEMO_API_KEY", "TOKEN_ENCRYPTION_KEY", "DISCORD_BOT_TOKEN", "DISCORD_CLIENT_SECRET"] },
   "d1_databases": [{
     "binding": "DB",
     "database_name": "telemetry",

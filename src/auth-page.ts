@@ -33,7 +33,7 @@ export function connectedPage(owner: string, nonce: string): string {
     </div>
     <section class="next" aria-label="次のステップ"><p class="label">NEXT STEPS</p>
       <div class="step"><span class="number" aria-hidden="true">1</span><p>${destination}に戻る<small>この認証画面は閉じて大丈夫です。</small></p></div>
-      <div class="step"><span class="number" aria-hidden="true">2</span><p>${discord ? '保存先を設定して、最初のタブを作成' : '最初のタブを作成'}<small>${discord ? '<code>/document</code> で保存先を設定 → <code>/create</code>' : '<code>pnpm run demo run --doc YOUR_DOCUMENT_ID</code>'}</small></p></div>
+      <div class="step"><span class="number" aria-hidden="true">2</span><p>${discord ? '保存先を設定して、MTGの日程調整を開始' : '最初のタブを作成'}<small>${discord ? '<code>/document</code> で保存先を設定 → <code>/mtg schedule</code>' : '<code>pnpm run demo run --doc YOUR_DOCUMENT_ID</code>'}</small></p></div>
       ${discord ? '<a class="return" href="https://discord.com/channels/' + owner.slice('discord:guild:'.length) + '">Discordに戻る<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></a>' : ''}
       <p class="hint">${discord ? 'この接続は、このサーバーの管理者間で共有されます。' : 'この接続はCLI専用です。Discordのサーバー接続とは独立しています。'}</p>
     </section>

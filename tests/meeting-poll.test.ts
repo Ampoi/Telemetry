@@ -3,11 +3,11 @@ import assert from 'node:assert/strict';
 import { readFile, readdir } from 'node:fs/promises';
 import { Miniflare, convertV4MiniflareOptions, Response as MockResponse } from 'miniflare';
 import { hash } from '../src/crypto';
-import { commonSlot, windowStart, DAY, SLOT, type PollState } from '../src/meeting-poll-model';
+import { meetingTitle, commonSlot, windowStart, DAY, SLOT, type PollState } from '../src/meeting-poll-model';
 import { discordCommands } from '../src/discord-commands';
 const guild='456789012345678901', owner='234567890123456789', guest='234567890123456780', outsider='234567890123456781';
 const origin='http://localhost:8787';
-let mf:Miniflare, serial=100n, notifications:any[]=[];
+let mf:Miniflare, serial=100n, notifications:any[]=[], memberListDenied=false;
 const tokens:Record<string,string>={[owner]:'owner-session',[guest]:'guest-session',[outsider]:'outsider-session'};
 async function create(){
   const id=(150000000000000000n+serial++).toString();
@@ -19,7 +19,7 @@ async function create(){
 async function call(id:string,path:string,user=owner,body?:unknown,extra:Record<string,string>={}){
   return mf.dispatchFetch(`${origin}/mtg/polls/${id}/${path}`,{method:body===undefined?'GET':'POST',headers:{Cookie:`mtg_session=${tokens[user]??''}`,Origin:origin,'Content-Type':'application/json',...extra},...(body===undefined?{}:{body:JSON.stringify(body)})});
 }
-async function configure(id:string){const r=await call(id,'configure',owner,{members:[guest],duration:60,title:'Weekly <script>'});assert.equal(r.status,200,await r.clone().text());return r.json() as Promise<any>}
+async function configure(id:string){const r=await call(id,'data');assert.equal(r.status,200,await r.clone().text());const data=await r.json() as any;assert.equal(data.status,'open');assert.equal(data.members.length,2);assert.equal(data.duration,undefined);return data}
 before(async()=>{
   mf=new Miniflare(convertV4MiniflareOptions({name:'poll-test',modules:true,scriptPath:'.test-dist/cloud-harness.js',compatibilityDate:'2026-09-15',compatibilityFlags:['nodejs_compat'],
     d1Databases:['DB'],r2Buckets:['MEDIA'],queueProducers:{DISCORD_JOBS:'docs',COLLECTION_JOBS:'collection'},
@@ -34,9 +34,11 @@ before(async()=>{
       }
       if(u.pathname==='/api/v10/users/@me'){assert.equal(request.headers.get('Authorization'),'Bearer fake-access');return MockResponse.json({id:guest,username:'Guest'});}
       if(u.pathname===`/api/v10/guilds/${guild}`)return MockResponse.json({owner_id:owner});
+      if(u.pathname===`/api/v10/guilds/${guild}/members` && memberListDenied)return MockResponse.json({code:50001},{status:403});
+      if(u.pathname===`/api/v10/guilds/${guild}/members`)return MockResponse.json([{user:{id:guest,username:'Guest'}},{user:{id:owner,username:'Host'}},{user:{id:'999999999999999998',username:'Bot',bot:true}}]);
       if(u.pathname.startsWith(`/api/v10/guilds/${guild}/members/`)){
         const id=u.pathname.split('/').at(-1)!;
-        return Object.hasOwn(tokens,id)?MockResponse.json({user:{id,username:id===owner?'Host':'Member'},roles:[]}):MockResponse.json({code:10007},{status:404});
+        return (id===owner||id===guest)?MockResponse.json({user:{id,username:id===owner?'Host':'Member'},roles:[]}):MockResponse.json({code:10007},{status:404});
       }
       if(request.method==='POST'){notifications.push(await request.json());return MockResponse.json({id:'987654321012345678'});}
       if(u.pathname==='/api/v10/channels/567890123456789012')return MockResponse.json({guild_id:guild});
@@ -66,14 +68,11 @@ test('login page exposes no data; authentication, CSRF, guild and participant sc
   const page=await mf.dispatchFetch(origin+'/mtg/polls/'+id);assert.equal(page.status,200);assert.match(page.headers.get('Content-Security-Policy')!,/nonce-/);assert.ok(!(await page.text()).includes('Weekly <script>'));
   assert.equal((await call(id,'data','unknown')).status,401);
   assert.equal((await call(id,'data',outsider)).status,403);
-  assert.equal((await call(id,'configure',guest,{members:[owner],duration:60,title:'spoof'})).status,403);
-  assert.equal((await call(id,'configure',owner,{members:[guest],duration:60,title:'spoof'},{Origin:'https://evil.example'})).status,403);
-  assert.equal((await call(id,'configure',owner,{members:['999999999999999999'],duration:60,title:'bad member'})).status,403);
   await configure(id);
+  assert.equal((await call(id,'answer',owner,{slots:[0]},{Origin:'https://evil.example'})).status,403);
   assert.equal((await call(id,'answer',outsider,{slots:[0,1]})).status,403);
   assert.equal((await call(id,'answer',guest,{slots:[-1]})).status,400);
   assert.equal((await call(id,'answer',guest,{slots:[0.5]})).status,400);
-  assert.equal((await call(id,'configure',owner,{members:[outsider],duration:60,title:'change'})).status,409);
   assert.equal((await call(id,'cancel',guest,{})).status,403);
 });
 test('OAuth state is cookie-bound and single use; sessions store hashes and logout revokes',async()=>{
@@ -103,7 +102,7 @@ test('empty answers remain open and are editable; simultaneous overlap books onc
   assert.equal(data.status,'confirmed');assert.equal(data.meetingAt,data.start+114*SLOT);
   assert.equal((await call(id,'answer',guest,{slots:[]})).status,409);
   const db=await mf.getD1Database('DB');const row=await db.prepare('SELECT * FROM meeting_reservations WHERE id=?').bind(id).first<any>();
-  assert.equal(row.meeting_at,data.meetingAt);assert.equal(row.run_at,data.meetingAt-3600_000);
+  assert.equal(row.title,meetingTitle(data.meetingAt));assert.equal(row.meeting_at,data.meetingAt);assert.equal(row.run_at,data.meetingAt-3600_000);
   const status=await mf.dispatchFetch(origin+'/test/meeting/summary',{method:'POST',body:JSON.stringify({id,guild})});assert.equal((await status.json() as any).status,'scheduled');
   assert.equal((await db.prepare('SELECT COUNT(*) AS n FROM meeting_reservations WHERE id=?').bind(id).first<any>()).n,1);
 });
@@ -112,4 +111,25 @@ test('owner cancellation prevents further answers and no reservation is created'
   assert.equal((await call(id,'cancel',owner,{})).status,200);
   assert.equal((await call(id,'answer',guest,{slots:[114,115]})).status,409);
   assert.equal(await(await mf.getD1Database('DB')).prepare('SELECT id FROM meeting_reservations WHERE id=?').bind(id).first(),null);
+});
+
+test('start-time scheduling accepts one shared slot and dates titles in JST',()=>{
+  const p={start:windowStart(Date.now()),members:[{id:owner,name:'Host'},{id:guest,name:'Guest'}],answers:{[owner]:[97],[guest]:[97]}} as unknown as PollState;
+  assert.equal(commonSlot(p,Date.now()),p.start+97*SLOT);
+  assert.equal(meetingTitle(Date.parse('2026-09-13T15:00:00Z')),'2026/09/14 定例mtg');
+});
+test('page skips host setup and a guest can open the poll first',async()=>{
+  const id=await create();
+  const html=await(await mf.dispatchFetch(origin+'/mtg/polls/'+id)).text();
+  assert.doesNotMatch(html,/setup-form|所要時間|他の参加者のDiscordユーザーID/);
+  const data=await(await call(id,'data',guest)).json() as any;
+  assert.equal(data.status,'open');assert.equal(data.members.length,2);
+  assert.equal((await call(id,'configure',owner,{})).status,404);
+});
+
+test('member list failure does not open a poll with a partial roster; refresh recovers',async()=>{
+  const id=await create();memberListDenied=true;
+  try { const r=await call(id,'data');assert.equal(r.status,503);assert.match(await r.text(),/Server Members Intent/); }
+  finally { memberListDenied=false; }
+  await configure(id);
 });

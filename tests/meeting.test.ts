@@ -17,6 +17,7 @@ const keys = generateKeyPairSync('ed25519');
 let mf: Miniflare, sequence = 0n;
 let cutoff: number, messages: RemoteMessage[], writes: {requests:Record<string,any>[]}[], replies: string[];
 let historyPaths: string[], imageStatus: number, textStatus: number, addStatus: number, rateOnce: boolean, revoked: boolean, contentIntent: boolean;
+let invitations: any[], invitationStatus: number, invitationMention: boolean;
 let notifications: any[], notifyStatus: number, summaryStatus: number, summaryInputs: any[];
 const newId = () => ((BigInt(Date.now() - 1420070400000) << 22n) + ++sequence).toString();
 function message(channel: string, at: number, text: string, extra: Partial<RemoteMessage> = {}): RemoteMessage {
@@ -76,11 +77,21 @@ before(async()=>{
         return textStatus===200?MockResponse.json({replies:body.requests.map(()=>({}))}):MockResponse.json({error:{}},{status:textStatus});
       }
       assert.equal(u.hostname,'discord.com');
+      if(request.method==='DELETE'){assert.match(u.pathname,/webhooks\/.+\/messages\/@original$/);replies.push('[deleted]');return new MockResponse(null,{status:204});}
       if(request.method==='PATCH'){const body=await request.json() as {content:string;allowed_mentions:{parse:string[]}};assert.deepEqual(body.allowed_mentions,{parse:[]});replies.push(body.content);return MockResponse.json({id:'reply'});}
       assert.equal(request.headers.get('Authorization'),'Bot fake-bot');
       if(request.method==='POST') {
         assert.equal(u.pathname,`/api/v10/channels/${root}/messages`);
-        notifications.push(await request.json());
+        const body=await request.json() as any;
+        if(body.content==='@everyone\n次回MTGの日時を入力してください！') {
+          invitations.push(body);
+          assert.deepEqual(body.allowed_mentions,{parse:['everyone']});
+          assert.match(body.components[0].components[0].url,/^http:\/\/localhost:8787\/mtg\/polls\/\d+$/);
+          assert.equal(body.components[0].components[0].label,'日程調整を開く');
+          assert.equal(body.enforce_nonce,true);
+          return invitationStatus===200?MockResponse.json({id:'123456789012345680',mention_everyone:invitationMention}):MockResponse.json({error:{}},{status:invitationStatus});
+        }
+        notifications.push(body);
         assert.ok(writes.some(w=>w.requests.some(r=>r.insertText)),'notify only after document writes');
         return notifyStatus===200 ? MockResponse.json({id:'123456789012345679',mention_everyone:true}) : MockResponse.json({retry_after:2},{status:notifyStatus});
       }
@@ -111,6 +122,7 @@ after(async()=>{await mf?.dispose();});
 beforeEach(()=>{
   cutoff=Date.now()-1000;messages=[message(root,Date.parse('2020-01-01T00:00:00Z'),'6年以上前の投稿 {{raw}}\n# この記号を残す')];
   writes=[];replies=[];historyPaths=[];imageStatus=textStatus=addStatus=200;rateOnce=revoked=false;contentIntent=true;
+  invitations=[];invitationStatus=200;invitationMention=true;
   notifications=[];summaryInputs=[];notifyStatus=summaryStatus=200;
 });
 
@@ -178,7 +190,7 @@ test('signed /mtg rejects DMs and non-managers, persists reservations, isolates 
     const r=await signed(p);const b=await r.json() as any;assert.equal(b.type,4);assert.match(b.data.content,/サーバー/);
   }
   const r=await signed(payload);assert.equal((await r.json() as any).type,5);
-  assert.match(await waitReply(0),/日程調整を作成/);
+  assert.equal(await waitReply(0),'[deleted]');assert.equal(invitations.length,1);
   const input: MeetingInput = {id:payload.id,guild,user,runAt:Date.now()+3600_000,title:'テスト',document};
   await harness('book',payload.id,{input});
   await (await mf.getD1Database('DB')).prepare('INSERT INTO meeting_reservations(id,guild,user,run_at,title,document,created) VALUES(?,?,?,?,?,?,?)').bind(payload.id,guild,user,input.runAt,input.title,document,Date.now()).run();
@@ -234,11 +246,13 @@ test('notification rate limit retries only the notification, while forbidden sto
 });
 test('signed poll creation is idempotent and legacy datetime arguments are rejected',async()=>{
   const payload=interaction('schedule');
-  await signed(payload);assert.match(await waitReply(0),/日程調整を作成/);
+  await signed(payload);assert.equal(await waitReply(0),'[deleted]');assert.equal(invitations.length,1);
   const db=await mf.getD1Database('DB');
   const row=await db.prepare('SELECT created FROM meeting_polls WHERE id=?').bind(payload.id).first<any>();
   const n=replies.length;await signed(payload);await waitReply(n);
   assert.equal((await db.prepare('SELECT created FROM meeting_polls WHERE id=?').bind(payload.id).first<any>()).created,row.created);
+  assert.equal(invitations.length,1,'re-delivery must not send another everyone mention');
+  assert.equal(invitations[0].nonce,`i${payload.id}`);
   assert.equal(await db.prepare('SELECT id FROM meeting_reservations WHERE id=?').bind(payload.id).first(),null);
   const n2=replies.length;await signed(interaction('schedule',[{name:'datetime',type:3,value:jst(Date.now()+1800_000)}]));
   assert.match(await waitReply(n2),/引数なし/);
@@ -267,7 +281,7 @@ test('debug executes the rolling week with Luna medium, reviewed images and no n
   const n=replies.length;await signed(payload);await waitReply(n);await harness('step',payload.id);
   assert.equal(summaryInputs.length,1);assert.equal(writes.filter(w=>w.requests[0].addDocumentTab).length,1);
   const n2=replies.length;await signed(interaction('status',[{name:'id',type:3,value:payload.id}]));
-  const status=await waitReply(n2);assert.match(status,/medium/);assert.match(status,/tab=t.meeting/);
+  const status=await waitReply(n2);assert.match(status,/アジェンダ.*完了/);assert.match(status,/tab=t.meeting/);
 });
 
 test('debug stops AI failure before Docs and never automatically pays for a retry',async()=>{
@@ -303,4 +317,15 @@ test('debug resumes persisted AI output after eviction without generating again'
   await mf.unsafeEvictDurableObject('meeting-test','TestMeetingScheduler',{name:`${guild}:${payload.id}`});
   assert.equal((await finish(payload.id)).status,'complete');assert.equal(summaryInputs.length,1);
   assert.equal(writes.filter(w=>w.requests[0].addDocumentTab).length,1);
+});
+
+test('uncertain invitation is never re-sent and only a private actionable error is shown',async()=>{
+  invitationStatus=503;const payload=interaction('schedule');
+  const response=await signed(payload);assert.equal((await response.json() as any).data.flags,64);
+  assert.match(await waitReply(0),/チャンネルを確認/);assert.equal(invitations.length,1);
+  const n=replies.length;await signed(payload);assert.match(await waitReply(n),/チャンネルを確認/);assert.equal(invitations.length,1);
+});
+test('missing everyone permission keeps the invitation and explains the needed permission privately',async()=>{
+  invitationMention=false;await signed(interaction('schedule'));
+  assert.match(await waitReply(0),/全員にメンション/);assert.equal(invitations.length,1);
 });

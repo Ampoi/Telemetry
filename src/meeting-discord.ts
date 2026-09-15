@@ -6,7 +6,6 @@ import type { Interaction } from './discord';
 import { DEBUG_MODEL, DEBUG_EFFORT, debugWindow } from './debug-agenda';
 
 const labels: Record<string, string> = { scheduled: '予約済み', collecting: '収集中', preparing: '本文準備中', adding: 'タブ作成中', writing: 'Docs書き込み中', summarizing: 'Docs完成・議題要約中', notifying: 'Docs完成・通知中', notification_failed: 'Docs完成・要約または通知失敗', notification_review: 'Docs完成・通知結果の確認が必要', complete: '完了', cancelled: '取消済み', failed: '失敗', needs_review: 'Docsの確認が必要' };
-function reply(content: string): Response { return Response.json({ type: 4, data: { content: content.slice(0, 2000), flags: 64, allowed_mentions: { parse: [] } } }); }
 const stub = (env: Env, guild: string, id: string) => env.MEETINGS.getByName(`${guild}:${id}`);
 
 export async function meetingInteraction(interaction: Interaction, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -23,10 +22,11 @@ export async function meetingInteraction(interaction: Interaction, env: Env, ctx
   const id = option('id');
   if (id && !/^\d{17,20}$/.test(id)) throw new AppError(400, '予約IDを指定してください。');
   if (command.name === 'cancel' && !id) throw new AppError(400, '取消する予約IDを指定してください。');
-  // Acknowledge within Discord's deadline; report success only after durable book().
+  // Keep validation failures private; successful invitations are public Bot posts.
   ctx.waitUntil((async () => {
     let content: string;
     let components: unknown[] = [];
+    let announced = false;
     try {
       if (command.name === 'debug') {
         if (command.options?.length) throw new AppError(400, '/mtg debug は引数なしで実行してください。直近168時間・Luna・mediumを使用します。');
@@ -52,8 +52,12 @@ export async function meetingInteraction(interaction: Interaction, env: Env, ctx
         const row = await env.DB.prepare('SELECT created FROM meeting_polls WHERE id=?').bind(interaction.id).first<{ created: number }>();
         await env.MEETING_POLLS.getByName(interaction.id).create({ id: interaction.id, guild, user: interaction.member!.user!.id, channel: interaction.channel_id, document: setting.document_id, created: row!.created });
         const url = `${appOrigin(env)}/mtg/polls/${interaction.id}`;
-        content = `次回MTGの日程調整を作成しました。\n${url}\nDiscordでログインし、参加者を指定して空き時間を回答してください。7日後を中心に5日間を表示します。全員が回答し、空き時間が一致すると自動で予約します。\n参加者にはこのURLを共有してください。`;
         components = [{ type: 1, components: [{ type: 2, style: 5, label: '日程調整を開く', url }] }];
+        const invitation = await env.MEETING_POLLS.getByName(interaction.id).announce();
+        announced = invitation === 'sent';
+        content = invitation === 'failed' ? '案内を送信できませんでした。Botの投稿権限を確認してください。'
+          : invitation === 'unmentioned' ? '案内は投稿しましたが、全員に通知できませんでした。Botの「全員にメンション」権限を確認してください。'
+          : '案内が届いているかチャンネルを確認してください。';
       } else {
         const rows = (await env.DB.prepare(`SELECT id,run_at FROM meeting_reservations WHERE guild=?${id ? ' AND id=?' : ''} ORDER BY run_at DESC LIMIT 8`).bind(guild, ...(id ? [id] : [])).all<{ id: string; run_at: number }>()).results;
         const polls = (await env.DB.prepare(`SELECT id,user FROM meeting_polls WHERE guild=?${id ? ' AND id=?' : ''} ORDER BY created DESC LIMIT 8`).bind(guild, ...(id ? [id] : [])).all<{ id: string; user: string }>()).results;
@@ -61,7 +65,7 @@ export async function meetingInteraction(interaction: Interaction, env: Env, ctx
         for (const p of polls.filter(p => !rows.some(r => r.id === p.id))) {
           const poll = env.MEETING_POLLS.getByName(p.id);
           const result = command.name === 'cancel' ? await poll.cancel(interaction.member!.user!.id) : await poll.view(p.user);
-          const statuses: Record<string, string> = { draft: '参加者設定待ち', open: '日程調整中', booking: '予約登録中', confirmed: '確定', cancelled: '取消済み' };
+          const statuses: Record<string, string> = { draft: '日程調整中', open: '日程調整中', booking: '予約登録中', confirmed: '確定', cancelled: '取消済み' };
           pollReports.push(`${p.id} | ${statuses[result.status]} | ${result.members.filter(m => m.answered).length}/${result.members.length}人回答\n${appOrigin(env)}/mtg/polls/${p.id}`);
         }
         if (!rows.length) content = 'このサーバーの予約が見つかりません。/mtg schedule で予約できます。';
@@ -71,7 +75,7 @@ export async function meetingInteraction(interaction: Interaction, env: Env, ctx
             let result;
             if (command.name === 'cancel') result = await stub(env, guild, row.id).cancel();
             else result = await stub(env, guild, row.id).summary();
-            reports.push(result ? `${result.id} | ${result.mode ? 'アジェンダ' : 'MTG'} ${jst(result.meetingAt ?? result.runAt)} JST | ${result.status === 'generating' ? 'アジェンダ生成中' : labels[result.status]}\n収集開始: ${jst(result.runAt)} JST${result.mode ? `\n期間: ${jst(result.rangeFrom!)} ～ ${jst(result.rangeTo!)} JST / ${result.model} / ${result.reasoningEffort}\nAPI呼出: ${result.requestCount ?? '未完了'} / AIへ送信した画像: ${result.reviewedImages ?? '未完了'}` : ''}\n${result.title} / 投稿 ${result.posts} / 残りの収集処理 ${result.pending} / 画像リンクへの代替 ${result.imageFallbacks}${result.skipped ? ` / アクセス不可 ${result.skipped}` : ''}${result.url ? `\n${result.url}` : ''}${result.error ? `\n${result.error}` : ''}` : `${row.id}: 予約を確定できませんでした。新しくコマンドを実行してください。`);
+            reports.push(result ? `${result.id} | ${result.mode ? 'アジェンダ' : 'MTG'} ${jst(result.meetingAt ?? result.runAt)} JST | ${result.status === 'generating' ? 'アジェンダ生成中' : labels[result.status]}\n${result.title}${result.url ? `\n${result.url}` : ''}${result.error ? `\n${result.error}` : ''}` : `${row.id}: 予約を確定できませんでした。新しくコマンドを実行してください。`);
           }
           content = reports.join('\n\n');
         }
@@ -85,7 +89,7 @@ export async function meetingInteraction(interaction: Interaction, env: Env, ctx
     }
     try {
       const response = await fetch(`https://discord.com/api/v10/webhooks/${interaction.application_id}/${encodeURIComponent(interaction.token)}/messages/@original`, {
-        method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: content.slice(0, 2000), components, allowed_mentions: { parse: [] } }), signal: AbortSignal.timeout(10_000),
+        method: announced ? 'DELETE' : 'PATCH', headers: { 'Content-Type': 'application/json' }, body: announced ? undefined : JSON.stringify({ content: content.slice(0, 2000), components, allowed_mentions: { parse: [] } }), signal: AbortSignal.timeout(10_000),
       });
       await response.body?.cancel();
       if (!response.ok) throw new Error('ReplyFailed');
