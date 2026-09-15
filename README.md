@@ -133,7 +133,16 @@ Workers完結版はこのpollを使用しません。
 
 ## Cloudflareへの展開
 
-このリポジトリの `wrangler.jsonc` は新規環境向けのプレースホルダーです。既存環境のID・URLを引き継ぎません。
+このリポジトリの `wrangler.jsonc` は本番Worker `telemetry` 向けに設定しています。
+公開URLは `https://telemetry.tange-toshihiro.workers.dev` です。
+2026-09-15時点で専用D1の作成・全5件のマイグレーション、`telemetry-docs`・`telemetry-collection` Queueの作成は完了しています。
+2026-09-15に本番デプロイ完了（Version: `d39c4d80-00bb-4238-999d-406090c58869`）。非公開R2 `telemetry-private`、5分Cron、両QueueのProducer・Consumerを接続しました。
+R2の公開URL・カスタムドメインは無効で、不完全multipart uploadは7日後に自動削除します。
+以下の作成コマンドで既存のD1・Queue・R2を重複作成しないでください。
+
+Discordアプリ `1548735050646949999` のInteractions EndpointはこのWorkerの `/discord/interactions` に切替済みです。`/auth`・`/document`・`/create`・`/telemetry` をグローバル登録しました。
+Google OAuthクライアントの承認済みリダイレクトURIには `https://telemetry.tange-toshihiro.workers.dev/auth/callback` が必要です（Google側の登録状況は未確認）。
+新規D1のためGoogle接続・保存先Docs・収集対象チャンネルは別途設定してください。旧デモの接続・収集データは移行していません。
 本番へのリソース作成・デプロイ・Discord登録は以下の手順で明示実行します。
 
 ```sh
@@ -182,7 +191,7 @@ pnpm run build
 2026-09-15の検証結果：Worker 47件、collector 33件、合計80件が成功しました。型チェック、dry-runビルド、ローカルD1初期化、health・API認証拒否・Cron handler、CLI preview・コマンド登録dry-runも確認しました。
 
 実サービスでのGoogle同意・Docs書き込み・Discord登録・公開CloudflareでのPC停止中稼働は、自動検証と別の確認項目です。
-今回の実装では本番デプロイや実サービスへの投稿・Docs書き込みは実施していません。指定されたDiscord Bot TokenとApplication IDの一致は、読み取りAPIで確認しました。
+本番デプロイ後、health 200、未認証API 401、認証済みstatus 200（D1接続）、不正Discord署名401を確認しました。Discordによる新Endpointの検証とコマンド登録も成功しています。実サービスへの投稿・Docs書き込みは実施していません。指定されたDiscord Bot TokenとApplication IDの一致は、読み取りAPIで確認しました。
 
 ### 設計資料
 

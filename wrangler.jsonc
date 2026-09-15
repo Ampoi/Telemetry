@@ -1,20 +1,21 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "telemetry",
+  "account_id": "dd55449a6d458eee5ce2e4d6cd5a3fe8",
   "main": "src/index.ts",
   "compatibility_date": "2026-09-15",
   "compatibility_flags": ["nodejs_compat"],
   "vars": {
-    "APP_ORIGIN": "http://localhost:8787",
-    "DISCORD_APPLICATION_ID": "",
-    "DISCORD_PUBLIC_KEY": "",
+    "APP_ORIGIN": "https://telemetry.tange-toshihiro.workers.dev",
+    "DISCORD_APPLICATION_ID": "1548735050646949999",
+    "DISCORD_PUBLIC_KEY": "bf03556bc7feeca9922c60e516931f2c1dc4403656074febbe221608c6b64fb7",
     "COLLECTION_MODE": "cloud"
   },
   "secrets": { "required": ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "DEMO_API_KEY", "TOKEN_ENCRYPTION_KEY", "DISCORD_BOT_TOKEN"] },
   "d1_databases": [{
     "binding": "DB",
     "database_name": "telemetry",
-    "database_id": "00000000-0000-0000-0000-000000000000",
+    "database_id": "3f37437e-bb29-41f5-b8fe-ed0568d76177",
     "migrations_dir": "migrations"
   }],
   "r2_buckets": [{ "binding": "MEDIA", "bucket_name": "telemetry-private" }],
