@@ -1,0 +1,35 @@
+{
+  "name": "telemetry",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.23.0",
+  "engines": {
+    "node": ">=24.0.0",
+    "pnpm": ">=11 <12"
+  },
+  "scripts": {
+    "preinstall": "node scripts/require-pnpm.mjs",
+    "setup": "tsx scripts/setup.ts",
+    "dev": "wrangler dev --ip localhost --port 8787",
+    "demo": "tsx scripts/cli.ts",
+    "discord:register": "tsx scripts/register-discord.ts",
+    "db:local": "wrangler d1 migrations apply telemetry --local",
+    "db:remote": "wrangler d1 migrations apply telemetry --remote",
+    "types": "wrangler types",
+    "typecheck": "tsc --noEmit",
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "test": "pnpm run build && pnpm exec wrangler deploy tests/cloud-harness.ts --dry-run --outdir .test-dist && tsx --test tests/*.test.ts",
+    "check": "pnpm types && pnpm typecheck && pnpm test && pnpm --filter @telemetry/collector check",
+    "deploy": "wrangler deploy",
+    "collector": "pnpm --filter @telemetry/collector start",
+    "telemetry": "tsx scripts/telemetry.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "miniflare": "5.20260911.0-alpha",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "wrangler": "4.131.1"
+  }
+}

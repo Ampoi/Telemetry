@@ -1,0 +1,10 @@
+GOOGLE_CLIENT_ID="replace-with-web-client-id.apps.googleusercontent.com"
+GOOGLE_CLIENT_SECRET="replace-with-client-secret"
+DEMO_API_KEY="generated-by-pnpm-setup"
+TOKEN_ENCRYPTION_KEY="generated-by-pnpm-setup"
+DISCORD_APPLICATION_ID="DiscordのApplication ID"
+DISCORD_PUBLIC_KEY="DiscordのPublic Key（64桁の16進数）"
+# Discordからローカルへ接続する場合はHTTPSトンネルのオリジン
+# APP_ORIGIN="https://your-tunnel.example"
+# Workers完結版の収集用Secret（ローカルcollector専用の場合は不要）
+DISCORD_BOT_TOKEN="replace-with-bot-token"

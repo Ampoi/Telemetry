@@ -1,0 +1,21 @@
+# DiscordのIDは必ず引用符で囲む（JavaScriptの数値丸めを防ぐ）。
+channels:
+  - id: "123456789012345678"
+    department: 開発
+storage:
+  database: data/telemetry-ts.sqlite3
+  attachments: data/attachments
+  exports: data/exports
+attachments:
+  max_size_mib: 100
+  concurrency: 2
+  timeout_seconds: 60
+  retries: 3
+  min_free_mib: 256
+collection:
+  include_bots: false
+  include_webhooks: false
+  reconnect_interval_seconds: 300
+control:
+  # WorkerがInteractionsを受信する共有アプリはworker。専用アプリはgateway。
+  mode: worker

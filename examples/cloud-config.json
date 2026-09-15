@@ -1,0 +1,9 @@
+{
+  "channels": [{ "id": "123456789012345678", "department": "開発" }],
+  "include_bots": false,
+  "include_webhooks": false,
+  "overlap_hours": 24,
+  "verify_days": 7,
+  "verify_interval_minutes": 60,
+  "max_attachment_mib": 100
+}

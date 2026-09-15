@@ -1,0 +1,34 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "telemetry",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-15",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "APP_ORIGIN": "http://localhost:8787",
+    "DISCORD_APPLICATION_ID": "",
+    "DISCORD_PUBLIC_KEY": "",
+    "COLLECTION_MODE": "cloud"
+  },
+  "secrets": { "required": ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "DEMO_API_KEY", "TOKEN_ENCRYPTION_KEY", "DISCORD_BOT_TOKEN"] },
+  "d1_databases": [{
+    "binding": "DB",
+    "database_name": "telemetry",
+    "database_id": "00000000-0000-0000-0000-000000000000",
+    "migrations_dir": "migrations"
+  }],
+  "r2_buckets": [{ "binding": "MEDIA", "bucket_name": "telemetry-private" }],
+  "queues": {
+    "producers": [
+      { "binding": "DISCORD_JOBS", "queue": "telemetry-docs" },
+      { "binding": "COLLECTION_JOBS", "queue": "telemetry-collection" }
+    ],
+    "consumers": [
+      { "queue": "telemetry-docs", "max_batch_size": 1, "max_batch_timeout": 1, "max_retries": 2, "max_concurrency": 1 },
+      { "queue": "telemetry-collection", "max_batch_size": 1, "max_batch_timeout": 1, "max_retries": 5, "max_concurrency": 2 }
+    ]
+  },
+  "triggers": { "crons": ["*/5 * * * *"] },
+  // OAuth query strings and credentials must not appear in invocation logs.
+  "observability": { "enabled": false }
+}
