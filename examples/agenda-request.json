@@ -1,0 +1,15 @@
+{
+  "project": "Telemetryサンプル",
+  "meetingAt": "2026-09-15 18:00 JST",
+  "guildId": "100",
+  "from": "2026-09-14",
+  "to": "2026-09-15",
+  "coverageNotes": [],
+  "messages": [{
+    "guild_id": "100", "channel_id": "200", "message_id": "300",
+    "created_at": "2026-09-14T01:00:00Z", "department": "開発",
+    "author_display_name": "サンプル投稿者",
+    "content": "試験を完了しました。結果の比較方法を次回の会議で相談したいです。",
+    "attachments": []
+  }]
+}
