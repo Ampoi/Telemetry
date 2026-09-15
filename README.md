@@ -11,6 +11,7 @@ Gatewayイベントを使う従来のNode.js collectorも `collector/` に用意
 - `/create`：新しいタブにテンプレートを書き込み。Queue再配信・同時再送の二重作成を防止。
 - `/telemetry status` / `/telemetry backfill days:30`：管理者限定の収集状況・履歴取得。
 - `/mtg schedule` / `status` / `cancel`：日本時間の日時を予約し、サーバー内の取得可能な全履歴を収集して1つのDocsタブへ記録。
+- `/mtg debug`：直近168時間を即時収集し、Luna・mediumで3部構成のアジェンダを生成してDocsへ出力。日程調整と全員通知は行いません。詳細は [アジェンダの手順](docs/agenda.md)。
 - Workers版の手動収集：REST取得、スレッド探索、D1投稿保存、R2画像・動画保存、JST期間指定JSONL。Cronによる定期収集は廃止しています。
 - ローカル版：Gatewayの投稿・編集・単独/一括削除、SQLite、ローカル添付保存。
 

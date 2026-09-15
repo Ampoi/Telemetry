@@ -13,7 +13,9 @@ const point = (overrides: Partial<Point> = {}): Point => ({ text: '試験を完�
 const agenda = (): Agenda => ({ summary: [point()], topics: [{ department: '開発', title: '試験', previous: [],
   results: [point({ mediaIds: ['400'] })], insights: [], blockers: [], next: [] }], discussions: [] });
 const response = (value: unknown = agenda(), extra: Record<string, unknown> = {}) => Response.json({ status: 'completed', output: [
-  { type: 'message', content: [{ type: 'output_text', text: JSON.stringify(value) }] }], usage: { input_tokens: 100, output_tokens: 50 }, ...extra });
+  { type: 'message', content: [{ type: 'output_text', text: JSON.stringify(value, (key, value) =>
+    key === 'sourceIds' ? value.map((id: string) => ({'300':'S1','301':'S2'}[id] ?? id)) :
+    key === 'mediaIds' ? value.map((id: string) => id === '400' ? 'A1' : id) : value) }] }], usage: { input_tokens: 100, output_tokens: 50 }, ...extra });
 const options = (fetch: typeof globalThis.fetch) => ({ apiKey: 'test-secret-never-real', model: 'gpt-5.6-luna', reasoningEffort: 'medium' as const, fetch });
 
 test('JST half-open dates, deletion wins even over later records, latest edit retained', () => {
@@ -56,6 +58,9 @@ test('Responses request separates source data, sends no storage paths, and retur
     const body = JSON.parse(String(init?.body));
     assert.equal(body.store, false); assert.equal(body.text.format.strict, true);
     assert.equal(body.reasoning.effort, 'medium');
+    const payload = JSON.parse(body.input[0].content[0].text);
+    assert.equal(payload.messages[0].message_id, 'S1');
+    assert.equal(payload.messages[0].attachments[0].attachment_id, 'A1');
     assert.ok(!String(init?.body).includes('guild/100/messages'));
     return response();
   }));
@@ -109,4 +114,32 @@ test('Docs adapter uses existing API contract and never re-expands generated tex
   assert.equal(renderTemplate(result.template,result.data),'# 結果\n{{do_not_expand}}');
   assert.throws(()=>agendaDocsInput({title:'週次',markdown:'a'.repeat(50001)},{document:'abcdef_12345',requestId:'agenda-test-0001'}));
   assert.throws(()=>agendaDocsInput({title:'週次',markdown:'本文'},{document:'abcdef_12345',requestId:'bad'}));
+});
+
+test('API reference aliases reject unknown IDs and restore long original IDs', async () => {
+  const original = '1532954331618476072';
+  const result = await generateAgenda(input([message({message_id:original,reply_to_message_id:'999999999999999999'})]), options(async (_, init) => {
+    const payload = JSON.parse(JSON.parse(String(init?.body)).input[0].content[0].text);
+    assert.equal(payload.messages[0].message_id, 'S1');
+    assert.equal(payload.messages[0].reply_to_message_id, null);
+    return response({summary:[point({sourceIds:['S1'],mediaIds:['A1']})],topics:[],discussions:[]});
+  }));
+  assert.deepEqual(result.agenda.summary[0].sourceIds,[original]);
+  assert.deepEqual(result.agenda.summary[0].mediaIds,['400']);
+  await assert.rejects(generateAgenda(input(), options(async () => response({summary:[point({sourceIds:['S999']})],topics:[],discussions:[]}))), /UNKNOWN_SOURCE/);
+});
+
+test('referencing an attachment cites its actual containing post too', async () => {
+  const result = await generateAgenda(input([message(),message({message_id:'301',attachments:[]})]),options(async()=>
+    response({summary:[point({sourceIds:['S2'],mediaIds:['A1']})],topics:[],discussions:[]})));
+  assert.deepEqual(result.agenda.summary[0].sourceIds,['301','300']);
+});
+
+test('a supported department topic can include another department blocker', () => {
+  const prepared = prepare(input([message(),message({message_id:'301',department:'電装',attachments:[]})]));
+  const value = agenda();
+  value.topics[0].blockers=[point({text:'電装側から接続不良の報告。',sourceIds:['301']})];
+  assert.equal(validateAgenda(value,prepared).topics[0].department,'開発');
+  value.topics[0].results=[];
+  assert.throws(()=>validateAgenda(value,prepared),/UNKNOWN_DEPARTMENT/);
 });

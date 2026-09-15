@@ -6,6 +6,7 @@ import { Miniflare, convertV4MiniflareOptions, Response as MockResponse } from '
 import { encrypt } from '../src/crypto';
 import { docsText, jst, jstTime, splitText, type MeetingInput } from '../src/meeting-model';
 import { snowflake, type RemoteMessage } from '../src/cloud/model';
+import { DEBUG_WEEK, debugWindow, agendaTextRequests } from '../src/debug-agenda';
 
 const guild = '456789012345678901', user = '234567890123456789', bot = '123456789012345678';
 const root = '567890123456789012', forum = '567890123456789013', hidden = '567890123456789014';
@@ -56,9 +57,16 @@ before(async()=>{
     outboundService:async request=>{
       const u=new URL(request.url);
       if(u.hostname==='api.openai.com'){
-        summaryInputs.push(await request.json());
+        const input = await request.json() as any; summaryInputs.push(input);
+        if (input.text.format.name === 'weekly_agenda') {
+          const payload = JSON.parse(input.input[0].content[0].text);
+          const first = payload.messages[0];
+          const point = { text: '構造試験の結果を確認する。', sourceIds: [first.message_id], mediaIds: first.attachments.map((a:any) => a.attachment_id) };
+          return summaryStatus === 200 ? MockResponse.json({status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify({summary:[point],topics:[],discussions:[]})}]}]}) : MockResponse.json({error:{}},{status:summaryStatus});
+        }
         return summaryStatus===200 ? MockResponse.json({status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify({lines:['進捗の確認 @everyone','課題の相談 @here','次の対応 <@123456789012345678>']})}]}]}) : MockResponse.json({error:{}},{status:summaryStatus});
       }
+      if(u.hostname==='cdn.discordapp.com') return new MockResponse(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZ2cAAAAASUVORK5CYII=','base64'),{headers:{'Content-Type':'image/png'}});
       if(u.hostname==='oauth2.googleapis.com')return MockResponse.json({access_token:'test-access',expires_in:3600});
       if(u.hostname==='docs.googleapis.com'){
         assert.equal(u.pathname,`/v1/documents/${document}:batchUpdate`);
@@ -234,4 +242,65 @@ test('signed poll creation is idempotent and legacy datetime arguments are rejec
   assert.equal(await db.prepare('SELECT id FROM meeting_reservations WHERE id=?').bind(payload.id).first(),null);
   const n2=replies.length;await signed(interaction('schedule',[{name:'datetime',type:3,value:jst(Date.now()+1800_000)}]));
   assert.match(await waitReply(n2),/引数なし/);
+});
+
+test('debug executes the rolling week with Luna medium, reviewed images and no notification; replay creates one tab',async()=>{
+  const payload=interaction('debug');
+  const end=Number((BigInt(payload.id)>>22n)+1420070400000n),start=end-DEBUG_WEEK;
+  messages=[message(root,start-1,'期間外'),message(root,start,'開始境界の構造試験'),message(root,end-1,'終了直前'),message(root,end,'終了境界は除外')];
+  messages[1].attachments=[{id:'890123456789012345',filename:'photo.png',content_type:'image/png',size:100,url:'https://cdn.discordapp.com/attachments/a/photo.png'}];
+  assert.equal((await(await signed(payload)).json() as any).type,5);
+  assert.match(await waitReply(0),/Luna|gpt-5.6-luna/);
+  const result=await finish(payload.id);
+  assert.equal(result.status,'complete');assert.equal(result.posts,2);
+  assert.equal(result.rangeFrom,start);assert.equal(result.rangeTo,end);
+  assert.equal(result.model,'gpt-5.6-luna');assert.equal(result.reasoningEffort,'medium');
+  assert.equal(summaryInputs.length,1);assert.equal(summaryInputs[0].model,'gpt-5.6-luna');assert.deepEqual(summaryInputs[0].reasoning,{effort:'medium'});
+  assert.ok(summaryInputs[0].input[0].content.some((c:any)=>c.type==='input_image'));
+  const apiText=JSON.stringify(summaryInputs);assert.ok(!apiText.includes('期間外'));assert.ok(!apiText.includes('終了境界は除外'));
+  assert.equal(notifications.length,0);assert.equal(result.reviewedImages,1);
+  assert.equal(writes.filter(w=>w.requests[0].addDocumentTab).length,1);
+  assert.equal(writes.filter(w=>w.requests[0].insertInlineImage).length,1);
+  const written=writes.flatMap(w=>w.requests.filter(r=>r.insertText).map(r=>r.insertText.text)).join('');
+  for(const heading of ['1. 今週のまとめ','2. 部門・テーマごとの進捗','3. 今日話し合うこと'])assert.ok(written.includes(heading));
+  assert.ok(!written.includes('##'));assert.ok(writes.some(w=>w.requests.some(r=>r.updateParagraphStyle)));
+  const n=replies.length;await signed(payload);await waitReply(n);await harness('step',payload.id);
+  assert.equal(summaryInputs.length,1);assert.equal(writes.filter(w=>w.requests[0].addDocumentTab).length,1);
+  const n2=replies.length;await signed(interaction('status',[{name:'id',type:3,value:payload.id}]));
+  const status=await waitReply(n2);assert.match(status,/medium/);assert.match(status,/tab=t.meeting/);
+});
+
+test('debug stops AI failure before Docs and never automatically pays for a retry',async()=>{
+  summaryStatus=503; const payload=interaction('debug');
+  messages=[message(root,Date.now()-3600_000,'電装試験')];
+  await signed(payload);await waitReply(0);const result=await finish(payload.id);
+  assert.equal(result.status,'failed');assert.match(result.error,/OPENAI_HTTP_503/);
+  assert.equal(summaryInputs.length,1);assert.equal(writes.length,0);
+  await harness('step',payload.id);assert.equal(summaryInputs.length,1);
+});
+
+test('debug empty period, permission denial and arbitrary options never generate a document',async()=>{
+  let payload=interaction('debug');messages=[];
+  await signed(payload);await waitReply(0);assert.equal((await finish(payload.id)).status,'failed');assert.equal(writes.length,0);assert.equal(summaryInputs.length,0);
+  payload=interaction('debug');
+  const r=await signed({...payload,member:{user:{id:user},permissions:'0'}});assert.match((await r.json() as any).data.content,/サーバー/);
+  const n=replies.length;await signed(interaction('debug',[{name:'model',type:3,value:'other'}]));assert.match(await waitReply(n),/引数なし/);
+});
+
+test('debug window and Markdown styles preserve UTF-16 offsets after images',()=>{
+  assert.deepEqual(debugWindow(1800000000000),{rangeFrom:1800000000000-DEBUG_WEEK,rangeTo:1800000000000});
+  const {text,requests}=agendaTextRequests('## 電装😀\n- 試験\n','t.debug',42);
+  assert.equal((requests[1].updateParagraphStyle as any).range.startIndex,42);
+  assert.ok(text.includes('電装😀'));assert.ok(requests.every(r=>!JSON.stringify(r).includes('t.meeting')));
+});
+
+test('debug resumes persisted AI output after eviction without generating again',async()=>{
+  const payload=interaction('debug');messages=[message(root,Date.now()-3600_000,'構造試験')];
+  await signed(payload);await waitReply(0);
+  let s:any;
+  for(let i=0;i<80;i++){s=await harness('step',payload.id);if(s.status==='adding')break;}
+  assert.equal(s.status,'adding');assert.equal(summaryInputs.length,1);assert.equal(writes.length,0);
+  await mf.unsafeEvictDurableObject('meeting-test','TestMeetingScheduler',{name:`${guild}:${payload.id}`});
+  assert.equal((await finish(payload.id)).status,'complete');assert.equal(summaryInputs.length,1);
+  assert.equal(writes.filter(w=>w.requests[0].addDocumentTab).length,1);
 });

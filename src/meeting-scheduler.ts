@@ -6,6 +6,7 @@ import { discord, DiscordError } from './cloud/discord-rest';
 import { iso, snowflake, type RemoteChannel, type RemoteMessage } from './cloud/model';
 import { mediaUrl } from './cloud/media';
 import { notificationText, summarizeMeeting, type SummaryEnv } from './meeting-summary';
+import { agendaParts, agendaTextRequests, createDebugAgenda, DEBUG_MODEL, DEBUG_EFFORT, DEBUG_WEEK, type DebugResult } from './debug-agenda';
 import { docsText, embeddable, jst, postText, splitText, textRequests, type ImagePart, type MeetingInput, type MeetingPost, type MeetingState } from './meeting-model';
 
 type Task = { id: string; kind: string; channel: string; cursor: string | null };
@@ -25,6 +26,7 @@ export class MeetingScheduler extends DurableObject<Env> {
         CREATE TABLE IF NOT EXISTS posts (id TEXT PRIMARY KEY, created TEXT NOT NULL, data TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS posts_order ON posts(created,id);
         CREATE TABLE IF NOT EXISTS parts (n INTEGER PRIMARY KEY, kind TEXT NOT NULL, value TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending');
+        CREATE TABLE IF NOT EXISTS agenda_result (id INTEGER PRIMARY KEY, data TEXT NOT NULL);
       `);
     });
   }
@@ -38,7 +40,7 @@ export class MeetingScheduler extends DurableObject<Env> {
   async book(input: MeetingInput): Promise<ReturnType<MeetingScheduler['summary']>> {
     const previous = this.state();
     if (previous) {
-      for (const key of ['id', 'guild', 'user', 'runAt', 'title', 'document', 'meetingAt', 'channel'] as const) {
+      for (const key of ['id', 'guild', 'user', 'runAt', 'title', 'document', 'meetingAt', 'channel', 'mode', 'rangeFrom', 'rangeTo'] as const) {
         if (previous[key] !== input[key]) throw new Error('ReservationConflict');
       }
       // Retrying a lost acknowledgment never recreates a completed/cancelled job.
@@ -46,7 +48,10 @@ export class MeetingScheduler extends DurableObject<Env> {
       return this.summary();
     }
     const deadline = input.meetingAt ?? input.runAt;
-    if (deadline <= Date.now() || deadline > Date.now() + 366 * 86400_000) throw new Error('ReservationDateOutOfRange');
+    if (input.mode === 'debug-agenda') {
+      if (!Number.isSafeInteger(input.rangeFrom) || !Number.isSafeInteger(input.rangeTo) || input.rangeTo! - input.rangeFrom! !== DEBUG_WEEK
+          || input.rangeTo! > Date.now() || input.rangeTo! < Date.now() - 14 * 60_000 || input.runAt !== input.rangeTo || input.channel || input.meetingAt) throw new AppError(400, 'デバッグの期間・実行時刻が不正、または受付期限切れです。');
+    } else if (deadline <= Date.now() || deadline > Date.now() + 366 * 86400_000) throw new Error('ReservationDateOutOfRange');
     const state: MeetingState = { ...input, status: 'scheduled', failures: 0, skipped: 0, imageFallbacks: 0, cursorCreated: '', cursorId: '', part: 0, textIndex: 1 };
     // SQL and alarm writes before the first await are atomically persisted.
     this.save(state);
@@ -58,7 +63,8 @@ export class MeetingScheduler extends DurableObject<Env> {
     if (!state) return null;
     const count = this.ctx.storage.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM posts').one().n;
     const pending = this.ctx.storage.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM tasks WHERE done=0').one().n;
-    return { id: state.id, guild: state.guild, runAt: state.runAt, meetingAt: state.meetingAt, channel: state.channel, notificationId: state.notificationId, title: state.title, status: state.status, url: state.url, error: state.error, posts: count, pending, skipped: state.skipped, imageFallbacks: state.imageFallbacks };
+    return { id: state.id, guild: state.guild, runAt: state.runAt, meetingAt: state.meetingAt, channel: state.channel, notificationId: state.notificationId, title: state.title, status: state.status, url: state.url, error: state.error, posts: count, pending, skipped: state.skipped, imageFallbacks: state.imageFallbacks,
+      mode: state.mode, rangeFrom: state.rangeFrom, rangeTo: state.rangeTo, model: state.mode ? DEBUG_MODEL : undefined, reasoningEffort: state.mode ? DEBUG_EFFORT : undefined, requestCount: state.requestCount, reviewedImages: state.reviewedImages };
   }
   async cancel() {
     const state = this.state();
@@ -86,7 +92,7 @@ export class MeetingScheduler extends DurableObject<Env> {
   }
   private async collect(state: MeetingState): Promise<void> {
     const task = this.ctx.storage.sql.exec<Task>('SELECT id,kind,channel,cursor FROM tasks WHERE done=0 ORDER BY id LIMIT 1').toArray()[0];
-    if (!task) { state.status = 'preparing'; this.save(state); return; }
+    if (!task) { state.status = state.mode === 'debug-agenda' ? 'generating' : 'preparing'; this.save(state); return; }
     if (task.kind === 'bootstrap') {
       await this.checkManager(state);
       const app = await discord<{ flags?: number; flags_new?: string }>(this.env, '/applications/@me');
@@ -109,11 +115,12 @@ export class MeetingScheduler extends DurableObject<Env> {
       const channel = this.ctx.storage.sql.exec<{ name: string; parent: string | null }>('SELECT name,parent FROM channels WHERE id=?', task.channel).one();
       for (const m of messages) {
         if (m.channel_id !== task.channel) throw new Error('ChannelMismatch');
-        if (Date.parse(m.timestamp) >= state.runAt || m.author.id === this.env.DISCORD_APPLICATION_ID) continue;
+        if (Date.parse(m.timestamp) >= state.runAt || (state.rangeFrom !== undefined && Date.parse(m.timestamp) < state.rangeFrom) || m.author.id === this.env.DISCORD_APPLICATION_ID) continue;
         const post: MeetingPost = { ...m, channel_name: channel.name, parent_id: channel.parent };
         this.ctx.storage.sql.exec('INSERT INTO posts(id,created,data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data', m.id, iso(m.timestamp), JSON.stringify(post));
       }
-      if (messages.length === 100) {
+      if (state.mode && this.ctx.storage.sql.exec<{ n: number; bytes: number }>('SELECT COUNT(*) AS n, COALESCE(SUM(length(data)),0) AS bytes FROM posts').toArray().some(r => r.n > 2000 || r.bytes > 1_500_000)) throw new AppError(400, 'デバッグ上限（2000投稿・本文メタデータ150万文字）を超えました。Docs作成前に停止しました。');
+      if (messages.length === 100 && !messages.some(m => state.rangeFrom !== undefined && Date.parse(m.timestamp) < state.rangeFrom)) {
         const before = messages.reduce((min, m) => BigInt(m.id) < BigInt(min) ? m.id : min, task.cursor!);
         if (BigInt(before) >= BigInt(task.cursor!)) throw new Error('PaginationStalled');
         this.ctx.storage.sql.exec('UPDATE tasks SET cursor=? WHERE id=?', before, task.id); return;
@@ -146,6 +153,39 @@ export class MeetingScheduler extends DurableObject<Env> {
       if (last?.kind === 'text' && last.value.length + text.length <= 12_000) this.ctx.storage.sql.exec('UPDATE parts SET value=? WHERE n=?', last.value + text, last.n);
       else this.ctx.storage.sql.exec('INSERT INTO parts(n,kind,value) VALUES(?,?,?)', state.part++, 'text', text);
     }
+  }
+  private async generate(state: MeetingState): Promise<void> {
+    if (state.generationStarted && !state.generationComplete) throw new AppError(409, 'AI生成が中断し結果を確認できません。重複課金を避けるため自動再実行しません。');
+    await this.checkManager(state);
+    const posts = this.ctx.storage.sql.exec<{ data: string }>('SELECT data FROM posts ORDER BY created,id').toArray().map(r => JSON.parse(r.data) as MeetingPost);
+    if (!state.generationComplete) {
+      const apiKey = (this.env as Env & { OPENAI_API_KEY?: string }).OPENAI_API_KEY;
+      if (!apiKey) throw new AppError(400, 'OPENAI_API_KEYをWorkerのSecretへ設定してください。');
+      state.generationStarted = true; this.save(state);
+      await this.ctx.storage.setAlarm(Date.now() + 15 * 60_000);
+      await this.ctx.storage.sync();
+      let result: DebugResult;
+      try { result = await createDebugAgenda(posts, state, apiKey); }
+      catch (error) {
+        if (error instanceof AppError) throw error;
+        throw new AppError(400, `アジェンダ生成を停止しました（${error instanceof Error && /^[A-Z_0-9]+$/.test(error.message) ? error.message : 'GENERATION_FAILED'}）。AI生成は自動再試行しません。`);
+      }
+      this.ctx.storage.sql.exec('INSERT INTO agenda_result(id,data) VALUES(1,?)', JSON.stringify(result));
+      state.generationComplete = true; state.requestCount = result.metadata.requestCount; state.reviewedImages = result.metadata.imageCount;
+      this.save(state); await this.ctx.storage.sync();
+    }
+    const result: DebugResult = JSON.parse(this.ctx.storage.sql.exec<{ data: string }>('SELECT data FROM agenda_result WHERE id=1').one().data);
+    // Transactionally prepare all output parts; an eviction cannot append them twice.
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec('DELETE FROM parts'); state.part = 0;
+      let text = '';
+      const flush = () => { if (text) { this.ctx.storage.sql.exec('INSERT INTO parts(n,kind,value) VALUES(?,?,?)', state.part++, 'markdown', text); text = ''; } };
+      for (const p of agendaParts(result, posts)) {
+        if (p.kind === 'image') { flush(); this.ctx.storage.sql.exec('INSERT INTO parts(n,kind,value) VALUES(?,?,?)', state.part++, p.kind, p.value); }
+        else for (const chunk of splitText(p.value)) { if (text.length + chunk.length > 12_000) flush(); text += chunk; }
+      }
+      flush(); state.status = 'adding'; this.task('docs-add', 'docs'); this.save(state);
+    });
   }
   private prepare(state: MeetingState): void {
     if (state.part === 0) this.addText(state, `${state.title}\nMTG日時: ${jst(state.meetingAt ?? state.runAt)} JST\n収集開始: ${jst(state.runAt)} JST\n収集範囲: サーバー内の取得可能な全履歴（収集開始時刻未満）\n投稿は収集時点の状態です。閲覧できないチャンネル・スレッド、削除済み投稿は含みません。\n画像は対応形式のみ埋め込み、動画はリンクです。添付URLには有効期限があります。\n\n`);
@@ -203,7 +243,7 @@ export class MeetingScheduler extends DurableObject<Env> {
       }
       if (!attachment || !embeddable(attachment)) { this.fallback(state, part); return; }
       requests = [{ insertInlineImage: { endOfSegmentLocation: { tabId: state.tabId }, uri: mediaUrl(attachment.url), objectSize: { width: { magnitude: 400, unit: 'PT' } } } }];
-    } else requests = textRequests(part.value, state.tabId!, state.textIndex);
+    } else requests = part.kind === 'markdown' ? agendaTextRequests(part.value, state.tabId!, state.textIndex).requests : textRequests(part.value, state.tabId!, state.textIndex);
     const token = await accessToken(this.env, guildOwner(state.guild));
     this.ctx.storage.sql.exec("UPDATE parts SET status='writing' WHERE n=?", part.n);
     await this.ctx.storage.sync();
@@ -214,7 +254,7 @@ export class MeetingScheduler extends DurableObject<Env> {
       throw error;
     }
     this.ctx.storage.sql.exec("UPDATE parts SET status='done' WHERE n=?", part.n);
-    state.textIndex += part.kind === 'image' ? 1 : part.value.length;
+    state.textIndex += part.kind === 'image' ? 1 : part.kind === 'markdown' ? agendaTextRequests(part.value, state.tabId!, state.textIndex).text.length : part.value.length;
     this.save(state);
     await this.ctx.storage.sync();
   }
@@ -284,6 +324,7 @@ export class MeetingScheduler extends DurableObject<Env> {
       if (phase === 'collecting') {
         for (let i = 0; i < 3 && state.status === 'collecting'; i++) await this.collect(state);
       } else if (phase === 'preparing') this.prepare(state);
+      else if (phase === 'generating') await this.generate(state);
       else if (phase === 'adding') await this.addTab(state);
       else if (phase === 'writing') await this.writePart(state);
       else if (phase === 'summarizing') await this.summarize(state);

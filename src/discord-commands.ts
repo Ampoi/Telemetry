@@ -2,6 +2,7 @@ export const discordCommands = [
   {
     name: 'mtg', type: 1, description: '日時を予約して全履歴を収集し、Google Docsのタブへ記録', default_member_permissions: '32',
     options: [
+      { name: 'debug', type: 1, description: '直近168時間をLuna・mediumでアジェンダ化しDocsへ即時出力（全員通知なし）' },
       { name: 'schedule', type: 1, description: '次回MTGの日程調整ページを作成（Discordログインで空き時間を回答）' },
       { name: 'status', type: 1, description: '予約・実行状況と作成したタブを確認', options: [
         { name: 'id', type: 3, description: '予約ID（省略すると直近8件）', required: false },

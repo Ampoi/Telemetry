@@ -18,9 +18,9 @@ test('agenda consumes actual D1 exportRecord output in Workers without changing 
       const payload = JSON.parse(body.input[0].content[0].text);
       const source = payload.messages[0];
       assert.equal(source.content,'試験を完了した。');
-      assert.equal(source.attachments[0].attachment_id,'400');
+      assert.equal(source.attachments[0].attachment_id,'A1');
       assert.ok(!JSON.stringify(body).includes('private-storage'));
-      const point = {text:'試験を完了した。',sourceIds:[source.message_id],mediaIds:['400']};
+      const point = {text:'試験を完了した。',sourceIds:[source.message_id],mediaIds:['A1']};
       return MockResponse.json({status:'completed',output:[{type:'message',content:[{type:'output_text',
         text:JSON.stringify({summary:[point],topics:[],discussions:[]})}]}]});
     },

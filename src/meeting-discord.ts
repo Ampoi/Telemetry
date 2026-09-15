@@ -3,6 +3,7 @@ import { guildOwner, requireGuildManager } from './discord-guild';
 import { jst } from './meeting-model';
 import { appOrigin } from './auth';
 import type { Interaction } from './discord';
+import { DEBUG_MODEL, DEBUG_EFFORT, debugWindow } from './debug-agenda';
 
 const labels: Record<string, string> = { scheduled: '予約済み', collecting: '収集中', preparing: '本文準備中', adding: 'タブ作成中', writing: 'Docs書き込み中', summarizing: 'Docs完成・議題要約中', notifying: 'Docs完成・通知中', notification_failed: 'Docs完成・要約または通知失敗', notification_review: 'Docs完成・通知結果の確認が必要', complete: '完了', cancelled: '取消済み', failed: '失敗', needs_review: 'Docsの確認が必要' };
 function reply(content: string): Response { return Response.json({ type: 4, data: { content: content.slice(0, 2000), flags: 64, allowed_mentions: { parse: [] } } }); }
@@ -12,7 +13,7 @@ export async function meetingInteraction(interaction: Interaction, env: Env, ctx
   const guild = requireGuildManager(interaction);
   if (env.COLLECTION_MODE !== 'cloud') throw new AppError(400, '/mtgにはクラウド収集モードが必要です。');
   const command = interaction.data?.options?.[0];
-  if (command?.type !== 1 || !['schedule', 'status', 'cancel'].includes(command.name)) throw new AppError(400, '/mtg schedule・status・cancelを指定してください。');
+  if (command?.type !== 1 || !['schedule', 'debug', 'status', 'cancel'].includes(command.name)) throw new AppError(400, '/mtg schedule・debug・status・cancelを指定してください。');
   const option = (name: string) => {
     const v = command.options?.find(o => o.name === name);
     if (!v) return '';
@@ -27,7 +28,21 @@ export async function meetingInteraction(interaction: Interaction, env: Env, ctx
     let content: string;
     let components: unknown[] = [];
     try {
-      if (command.name === 'schedule') {
+      if (command.name === 'debug') {
+        if (command.options?.length) throw new AppError(400, '/mtg debug は引数なしで実行してください。直近168時間・Luna・mediumを使用します。');
+        if (!(env as Env & { OPENAI_API_KEY?: string }).OPENAI_API_KEY) throw new AppError(400, 'OPENAI_API_KEYをWorkerのSecretへ設定してください。');
+        const runAt = Number((BigInt(interaction.id) >> 22n) + 1420070400000n);
+        if (runAt > Date.now() || runAt < Date.now() - 14 * 60_000) throw new AppError(400, 'コマンドの受付期限が切れました。');
+        const previous = await env.DB.prepare('SELECT document,title FROM meeting_reservations WHERE id=? AND guild=?').bind(interaction.id, guild).first<{ document: string; title: string }>();
+        const setting = await env.DB.prepare('SELECT document_id FROM discord_guild_settings WHERE guild_id=?').bind(guild).first<{ document_id: string }>();
+        const document = previous?.document ?? setting?.document_id;
+        if (!document) throw new AppError(400, '先に /document document:URL で保存先を設定してください。');
+        if (!await env.DB.prepare('SELECT id FROM credentials WHERE id=?').bind(guildOwner(guild)).first()) throw new AppError(400, '先に /auth でこのサーバーをGoogleに接続してください。');
+        const title = previous?.title ?? `週次アジェンダ ${jst(runAt)}`;
+        await env.DB.prepare('INSERT OR IGNORE INTO meeting_reservations(id,guild,user,run_at,title,document,created) VALUES(?,?,?,?,?,?,?)').bind(interaction.id, guild, interaction.member!.user!.id, runAt, title, document, runAt).run();
+        const result = await stub(env, guild, interaction.id).book({ id: interaction.id, guild, user: interaction.member!.user!.id, runAt, title, document, mode: 'debug-agenda', ...debugWindow(runAt) });
+        content = `週次アジェンダ ${labels[result!.status] ?? result!.status}\n期間: ${jst(runAt - 7 * 86400_000)} ～ ${jst(runAt)} JST（直近168時間）\nモデル: ${DEBUG_MODEL} / 推論: ${DEBUG_EFFORT}\n全履歴の収集設定を変更せず、取得できる投稿・画像を3部構成にまとめ、新しいDocsタブへ出力します。全員通知は行いません。\n進捗・結果: /mtg status id:${interaction.id}`;
+      } else if (command.name === 'schedule') {
         if (command.options?.length) throw new AppError(400, '/mtg schedule は引数なしで実行してください。');
         if (!interaction.channel_id || !/^\d{17,20}$/.test(interaction.channel_id)) throw new AppError(400, '通知先のチャンネル内で実行してください。');
         const setting = await env.DB.prepare('SELECT document_id FROM discord_guild_settings WHERE guild_id=?').bind(guild).first<{ document_id: string }>();
@@ -56,7 +71,7 @@ export async function meetingInteraction(interaction: Interaction, env: Env, ctx
             let result;
             if (command.name === 'cancel') result = await stub(env, guild, row.id).cancel();
             else result = await stub(env, guild, row.id).summary();
-            reports.push(result ? `${result.id} | MTG ${jst(result.meetingAt ?? result.runAt)} JST | ${labels[result.status]}\n収集開始: ${jst(result.runAt)} JST\n${result.title} / 投稿 ${result.posts} / 残りの収集処理 ${result.pending} / 画像リンクへの代替 ${result.imageFallbacks}${result.skipped ? ` / アクセス不可 ${result.skipped}` : ''}${result.url ? `\n${result.url}` : ''}${result.error ? `\n${result.error}` : ''}` : `${row.id}: 予約を確定できませんでした。新しく /mtg schedule を実行してください。`);
+            reports.push(result ? `${result.id} | ${result.mode ? 'アジェンダ' : 'MTG'} ${jst(result.meetingAt ?? result.runAt)} JST | ${result.status === 'generating' ? 'アジェンダ生成中' : labels[result.status]}\n収集開始: ${jst(result.runAt)} JST${result.mode ? `\n期間: ${jst(result.rangeFrom!)} ～ ${jst(result.rangeTo!)} JST / ${result.model} / ${result.reasoningEffort}\nAPI呼出: ${result.requestCount ?? '未完了'} / AIへ送信した画像: ${result.reviewedImages ?? '未完了'}` : ''}\n${result.title} / 投稿 ${result.posts} / 残りの収集処理 ${result.pending} / 画像リンクへの代替 ${result.imageFallbacks}${result.skipped ? ` / アクセス不可 ${result.skipped}` : ''}${result.url ? `\n${result.url}` : ''}${result.error ? `\n${result.error}` : ''}` : `${row.id}: 予約を確定できませんでした。新しくコマンドを実行してください。`);
           }
           content = reports.join('\n\n');
         }

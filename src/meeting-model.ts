@@ -2,13 +2,14 @@ import { AppError } from './errors';
 import { mediaUrl } from './cloud/media';
 import type { RemoteMessage } from './cloud/model';
 
-export interface MeetingInput { id: string; guild: string; user: string; runAt: number; title: string; document: string; meetingAt?: number; channel?: string }
-export type MeetingStatus = 'scheduled' | 'collecting' | 'preparing' | 'adding' | 'writing' | 'summarizing' | 'notifying' | 'notification_failed' | 'notification_review' | 'complete' | 'failed' | 'needs_review' | 'cancelled';
+export interface MeetingInput { id: string; guild: string; user: string; runAt: number; title: string; document: string; meetingAt?: number; channel?: string; mode?: 'debug-agenda'; rangeFrom?: number; rangeTo?: number }
+export type MeetingStatus = 'scheduled' | 'collecting' | 'preparing' | 'generating' | 'adding' | 'writing' | 'summarizing' | 'notifying' | 'notification_failed' | 'notification_review' | 'complete' | 'failed' | 'needs_review' | 'cancelled';
 export interface MeetingState extends MeetingInput {
   status: MeetingStatus; started?: number; finished?: number; error?: string;
   tabId?: string; url?: string; failures: number; skipped: number; imageFallbacks: number;
   cursorCreated: string; cursorId: string; part: number; textIndex: number;
   summaryPart?: number; agendaLines?: string[]; notificationAttempted?: boolean; notificationId?: string;
+  generationStarted?: boolean; generationComplete?: boolean; requestCount?: number; reviewedImages?: number;
 }
 export interface MeetingPost extends RemoteMessage { channel_name: string; parent_id: string | null }
 export interface ImagePart { channel: string; message: string; attachment: string }
