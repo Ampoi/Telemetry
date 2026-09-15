@@ -5,8 +5,10 @@ import { claim, context, saveMessage, tombstone } from '../src/cloud/store';
 import { consume, dispatch } from '../src/cloud/jobs';
 import { cleanup } from '../src/cloud/media';
 import type { Task, RemoteMessage } from '../src/cloud/model';
+export { MeetingPoll } from '../src/meeting-poll';
 export { MeetingScheduler } from '../src/meeting-scheduler';
 export { CollectionRecovery } from '../src/cloud/recovery';
+import { MeetingPoll } from '../src/meeting-poll';
 import { MeetingScheduler } from '../src/meeting-scheduler';
 import { CollectionRecovery } from '../src/cloud/recovery';
 import type { MeetingInput, MeetingState } from '../src/meeting-model';
@@ -33,6 +35,11 @@ export default {
     if(path==='/test/config') { try { return await cloudApi(new Request(request.url.replace('/test/config','/api/telemetry/config'), request),env); } catch(error) { return Response.json({error:String(error),stack:error instanceof Error?error.stack:null},{status:500}); } }
     if(!path.startsWith('/test/'))return worker.fetch(request,env,ctx);
     try{
+      if(path==='/test/poll') {
+        const data=await request.json() as {input:import('../src/meeting-poll-model').PollInput};
+        await env.MEETING_POLLS.getByName(data.input.id).create(data.input);
+        return Response.json({ok:true});
+      }
       if(path==='/test/recovery') {
         const data=await request.json() as {guild:string;expire?:boolean};
         const stub=(env.COLLECTION_RECOVERY as unknown as DurableObjectNamespace<TestCollectionRecovery>).getByName(data.guild);

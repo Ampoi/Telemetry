@@ -2,10 +2,7 @@ export const discordCommands = [
   {
     name: 'mtg', type: 1, description: '日時を予約して全履歴を収集し、Google Docsのタブへ記録', default_member_permissions: '32',
     options: [
-      { name: 'schedule', type: 1, description: '予約時刻に全チャンネル・スレッドの履歴収集を開始', options: [
-        { name: 'datetime', type: 3, description: '実行日時（日本時間 YYYY-MM-DD HH:mm）', required: true, min_length: 16, max_length: 16 },
-        { name: 'title', type: 3, description: '作成するタブ名', required: false, min_length: 1, max_length: 100 },
-      ] },
+      { name: 'schedule', type: 1, description: '次回MTGの日程調整ページを作成（Discordログインで空き時間を回答）' },
       { name: 'status', type: 1, description: '予約・実行状況と作成したタブを確認', options: [
         { name: 'id', type: 3, description: '予約ID（省略すると直近8件）', required: false },
       ] },

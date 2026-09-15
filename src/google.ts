@@ -2,7 +2,23 @@ import { decrypt } from './crypto';
 import { AppError } from './errors';
 
 export const DOCS_SCOPE = 'https://www.googleapis.com/auth/documents';
+export const LOGIN_SCOPE = `${DOCS_SCOPE} openid email`;
 export interface TokenResponse { access_token: string; refresh_token?: string; scope?: string; expires_in: number }
+
+export async function accountEmail(tokens: TokenResponse): Promise<string | null> {
+  const scopes = tokens.scope?.split(' ') ?? [];
+  if (!scopes.includes('email') && !scopes.includes('https://www.googleapis.com/auth/userinfo.email')) return null;
+  // Email is display metadata. An unavailable or withheld field must not lose
+  // a successfully established Docs connection or retain the previous email.
+  try {
+    const response = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
+      headers: { Authorization: `Bearer ${tokens.access_token}` }, redirect: 'manual', signal: AbortSignal.timeout(10_000),
+    });
+    if (!response.ok) { await response.body?.cancel(); return null; }
+    const body = await response.json<{ email?: unknown; email_verified?: unknown }>();
+    return body.email_verified === true && typeof body.email === 'string' && body.email.length <= 254 && /^[^\s<>@]+@[^\s<>@]+$/.test(body.email) ? body.email : null;
+  } catch { return null; }
+}
 
 export async function exchangeToken(env: Env, parameters: Record<string, string>): Promise<TokenResponse> {
   let response: Response;

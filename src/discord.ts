@@ -7,6 +7,7 @@ import { cloudInteraction } from './cloud/api';
 import { acceptCollector } from './collector-control';
 import { guildOwner, requireGuildManager } from './discord-guild';
 import { meetingInteraction } from './meeting-discord';
+import { connectionProfile, consumeProfile, refreshProfile, type ProfileJob } from './discord-profile';
 
 export interface Interaction {
   id: string;
@@ -14,12 +15,14 @@ export interface Interaction {
   type: number;
   token: string;
   guild_id?: string;
+  channel_id?: string;
   member?: { user?: { id: string }; permissions?: string };
   user?: { id: string };
   data?: { name: string; options?: { name: string; type: number; value: unknown; options?: { name: string; type: number; value: unknown }[] }[] };
 }
 interface CreateJob { id: string; applicationId: string; token: string; guildId: string; owner: string; document: string; title: string; message: string; createdAt: string; expiresAt: number }
 export interface DiscordJobEnvelope { id: string; encrypted: string }
+export type DiscordQueueJob = DiscordJobEnvelope | ProfileJob;
 
 function ephemeral(content: string) {
   return Response.json({ type: 4, data: { content, flags: 64, allowed_mentions: { parse: [] } } });
@@ -70,8 +73,9 @@ export async function handleDiscord(request: Request, env: Env, ctx: ExecutionCo
     const owner = guildOwner(guildId);
     if (interaction.data?.name === 'auth') {
       const login = await createLogin(env, owner);
+      refreshProfile(env, ctx, guildId);
       return Response.json({ type: 4, data: {
-        content: `このサーバー（ID: ${guildId}）専用のGoogle接続です。接続したアカウントは、このサーバーの管理者による /create に使用されます。下のボタンから編集を許可してください（10分間有効）。このリンクは他の人に渡さないでください。`,
+        content: `このサーバー（ID: ${guildId}）専用のGoogle接続です。接続したアカウントは、このサーバーの管理者による /create に使用されます。接続メールアドレスと保存先URLは、このサーバーのBotプロフィールに表示されます。下のボタンから編集を許可してください（10分間有効）。このリンクは他の人に渡さないでください。`,
         flags: 64, allowed_mentions: { parse: [] },
         components: [{ type: 1, components: [{ type: 2, style: 5, label: 'Googleアカウントを接続', url: login.url }] }],
       } });
@@ -90,11 +94,12 @@ export async function handleDiscord(request: Request, env: Env, ctx: ExecutionCo
         const id = documentId(specifiedDocument);
         await env.DB.prepare('INSERT INTO discord_guild_settings (guild_id, document_id, updated_by, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(guild_id) DO UPDATE SET document_id = excluded.document_id, updated_by = excluded.updated_by, updated_at = excluded.updated_at')
           .bind(guildId, id, userId, Date.now()).run();
+        refreshProfile(env, ctx, guildId);
         return ephemeral(`このサーバーの保存先を設定しました。\nhttps://docs.google.com/document/d/${id}/edit\n/auth で接続後、/create でタブを作成できます。`);
       }
-      const settings = await env.DB.prepare('SELECT document_id FROM discord_guild_settings WHERE guild_id = ?').bind(guildId).first<{ document_id: string }>();
-      const connection = await env.DB.prepare('SELECT connected_at FROM credentials WHERE id = ?').bind(owner).first();
-      return ephemeral(`このサーバーの保存先: ${settings ? `https://docs.google.com/document/d/${settings.document_id}/edit` : '未設定（/document document:URL で設定）'}\nGoogle接続: ${connection ? '登録済み（有効性は作成時に確認）' : '未接続（/auth で接続）'}`);
+      const profile = await connectionProfile(env, guildId);
+      refreshProfile(env, ctx, guildId);
+      return ephemeral(`このサーバーの保存先: ${profile.documentUrl ?? '未設定（/document document:URL で設定）'}\nGoogle接続: ${profile.connected ? `登録済み（有効性は作成時に確認）\nメール: ${profile.email ?? '未取得（/auth で再接続）'}` : '未接続（/auth で接続）'}`);
     }
     const settings = specifiedDocument ? null : await env.DB.prepare('SELECT document_id FROM discord_guild_settings WHERE guild_id = ?').bind(guildId).first<{ document_id: string }>();
     const targetDocument = specifiedDocument || settings?.document_id;
@@ -135,10 +140,15 @@ async function editReply(job: CreateJob, content: string): Promise<void> {
   if (!response.ok) throw new Error(`Discord reply failed: ${response.status}`);
 }
 
-export async function consumeDiscordJobs(batch: MessageBatch<DiscordJobEnvelope>, env: Env): Promise<void> {
+export async function consumeDiscordJobs(batch: MessageBatch<DiscordQueueJob>, env: Env): Promise<void> {
   for (const queued of batch.messages) {
+    if ('kind' in queued.body && queued.body.kind === 'profile') {
+      await consumeProfile(queued as Message<ProfileJob>, env);
+      continue;
+    }
     try {
-      const job = JSON.parse(await decrypt(queued.body.encrypted, env.TOKEN_ENCRYPTION_KEY, `discord-job:${queued.body.id}`)) as CreateJob;
+      const envelope = queued.body as DiscordJobEnvelope;
+      const job = JSON.parse(await decrypt(envelope.encrypted, env.TOKEN_ENCRYPTION_KEY, `discord-job:${envelope.id}`)) as CreateJob;
       if (job.expiresAt <= Date.now()) { queued.ack(); continue; }
       // Pre-migration jobs have personal credentials and no server context.
       if (!/^\d{17,20}$/.test(job.guildId ?? '') || job.owner !== guildOwner(job.guildId)) {

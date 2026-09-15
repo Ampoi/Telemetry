@@ -8,3 +8,9 @@ DISCORD_PUBLIC_KEY="DiscordのPublic Key（64桁の16進数）"
 # APP_ORIGIN="https://your-tunnel.example"
 # Workers完結版の収集用Secret（ローカルcollector専用の場合は不要）
 DISCORD_BOT_TOKEN="replace-with-bot-token"
+# MTG完成通知の議題要約（収集テキストをOpenAI APIへ送信）
+OPENAI_API_KEY="replace-with-openai-api-key"
+MTG_SUMMARY_MODEL="gpt-5-mini"
+
+# Discord OAuth2 Client Secret（Bot Tokenとは別）。Redirect: APP_ORIGIN/mtg/login/callback
+DISCORD_CLIENT_SECRET=

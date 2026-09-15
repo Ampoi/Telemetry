@@ -5,14 +5,15 @@ import { accessToken, googleDocs } from './google';
 import { discord, DiscordError } from './cloud/discord-rest';
 import { iso, snowflake, type RemoteChannel, type RemoteMessage } from './cloud/model';
 import { mediaUrl } from './cloud/media';
+import { notificationText, summarizeMeeting, type SummaryEnv } from './meeting-summary';
 import { docsText, embeddable, jst, postText, splitText, textRequests, type ImagePart, type MeetingInput, type MeetingPost, type MeetingState } from './meeting-model';
 
 type Task = { id: string; kind: string; channel: string; cursor: string | null };
 type Part = { n: number; kind: string; value: string; status: string };
-const terminal = new Set(['complete', 'failed', 'needs_review', 'cancelled']);
+const terminal = new Set(['complete', 'failed', 'needs_review', 'cancelled', 'notification_failed', 'notification_review']);
 
 // One persistent alarm/state machine per reservation. No Discord reply token is
-// retained: completion is read through the manager-only /mtg status command.
+// retained: completion notifications use the Bot token and a persisted channel.
 export class MeetingScheduler extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -37,18 +38,19 @@ export class MeetingScheduler extends DurableObject<Env> {
   async book(input: MeetingInput): Promise<ReturnType<MeetingScheduler['summary']>> {
     const previous = this.state();
     if (previous) {
-      for (const key of ['id', 'guild', 'user', 'runAt', 'title', 'document'] as const) {
+      for (const key of ['id', 'guild', 'user', 'runAt', 'title', 'document', 'meetingAt', 'channel'] as const) {
         if (previous[key] !== input[key]) throw new Error('ReservationConflict');
       }
       // Retrying a lost acknowledgment never recreates a completed/cancelled job.
       if (previous.status === 'scheduled') await this.ctx.storage.setAlarm(previous.runAt);
       return this.summary();
     }
-    if (input.runAt <= Date.now() || input.runAt > Date.now() + 366 * 86400_000) throw new Error('ReservationDateOutOfRange');
+    const deadline = input.meetingAt ?? input.runAt;
+    if (deadline <= Date.now() || deadline > Date.now() + 366 * 86400_000) throw new Error('ReservationDateOutOfRange');
     const state: MeetingState = { ...input, status: 'scheduled', failures: 0, skipped: 0, imageFallbacks: 0, cursorCreated: '', cursorId: '', part: 0, textIndex: 1 };
     // SQL and alarm writes before the first await are atomically persisted.
     this.save(state);
-    await this.ctx.storage.setAlarm(input.runAt);
+    await this.ctx.storage.setAlarm(Math.max(Date.now() + 1, input.runAt));
     return this.summary();
   }
   summary() {
@@ -56,7 +58,7 @@ export class MeetingScheduler extends DurableObject<Env> {
     if (!state) return null;
     const count = this.ctx.storage.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM posts').one().n;
     const pending = this.ctx.storage.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM tasks WHERE done=0').one().n;
-    return { id: state.id, guild: state.guild, runAt: state.runAt, title: state.title, status: state.status, url: state.url, error: state.error, posts: count, pending, skipped: state.skipped, imageFallbacks: state.imageFallbacks };
+    return { id: state.id, guild: state.guild, runAt: state.runAt, meetingAt: state.meetingAt, channel: state.channel, notificationId: state.notificationId, title: state.title, status: state.status, url: state.url, error: state.error, posts: count, pending, skipped: state.skipped, imageFallbacks: state.imageFallbacks };
   }
   async cancel() {
     const state = this.state();
@@ -146,7 +148,7 @@ export class MeetingScheduler extends DurableObject<Env> {
     }
   }
   private prepare(state: MeetingState): void {
-    if (state.part === 0) this.addText(state, `${state.title}\n予約日時: ${jst(state.runAt)} JST\n収集範囲: サーバー内の取得可能な全履歴（予約時刻未満）\n投稿は収集時点の状態です。閲覧できないチャンネル・スレッド、削除済み投稿は含みません。\n画像は対応形式のみ埋め込み、動画はリンクです。添付URLには有効期限があります。\n\n`);
+    if (state.part === 0) this.addText(state, `${state.title}\nMTG日時: ${jst(state.meetingAt ?? state.runAt)} JST\n収集開始: ${jst(state.runAt)} JST\n収集範囲: サーバー内の取得可能な全履歴（収集開始時刻未満）\n投稿は収集時点の状態です。閲覧できないチャンネル・スレッド、削除済み投稿は含みません。\n画像は対応形式のみ埋め込み、動画はリンクです。添付URLには有効期限があります。\n\n`);
     const rows = this.ctx.storage.sql.exec<{ id: string; created: string; data: string }>('SELECT id,created,data FROM posts WHERE (created,id)>(?,?) ORDER BY created,id LIMIT 50', state.cursorCreated, state.cursorId).toArray();
     for (const row of rows) {
       const post: MeetingPost = JSON.parse(row.data);
@@ -185,7 +187,7 @@ export class MeetingScheduler extends DurableObject<Env> {
   }
   private async writePart(state: MeetingState): Promise<void> {
     const part = this.ctx.storage.sql.exec<Part>("SELECT * FROM parts WHERE status<>'done' ORDER BY n LIMIT 1").toArray()[0];
-    if (!part) { state.status = 'complete'; state.finished = Date.now(); this.save(state); return; }
+    if (!part) { state.status = state.channel ? 'summarizing' : 'complete'; state.finished = Date.now(); this.save(state); return; }
     if (part.status === 'writing') throw new AppError(409, '本文・画像の書き込み結果が不明です。作成済みタブを確認してください。');
     let requests: Record<string, unknown>[];
     if (part.kind === 'image') {
@@ -220,6 +222,51 @@ export class MeetingScheduler extends DurableObject<Env> {
     this.ctx.storage.sql.exec("UPDATE parts SET status='done' WHERE n=?", part.n);
     state.imageFallbacks++; this.save(state);
   }
+  private async summarize(state: MeetingState): Promise<void> {
+    // Read bounded text parts in chronological order, retaining the merged summary.
+    const part = this.ctx.storage.sql.exec<Part>("SELECT * FROM parts WHERE kind='text' AND n>=? ORDER BY n LIMIT 1", state.summaryPart ?? 0).toArray()[0];
+    const total = this.ctx.storage.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM posts').one().n;
+    if (!total) state.agendaLines = ['収集対象の投稿がありませんでした。', '投稿から議題を抽出できませんでした。', '当日の議題はMTGで確認してください。'];
+    else if (part) {
+      state.agendaLines = await summarizeMeeting(this.env as Env & SummaryEnv, state.agendaLines ?? [], part.value);
+      state.summaryPart = part.n + 1;
+      this.save(state); return;
+    }
+    state.status = 'notifying'; this.save(state);
+  }
+  private async notify(state: MeetingState): Promise<void> {
+    if (state.notificationAttempted) {
+      state.status = 'notification_review'; state.error = '通知の送信結果が不明です。通知先チャンネルを確認してください。'; this.save(state); return;
+    }
+    await this.checkManager(state);
+    const channel = await discord<RemoteChannel>(this.env, `/channels/${state.channel}`);
+    if (channel.guild_id !== state.guild) throw new AppError(403, '通知先のサーバーが一致しません。');
+    if (!state.url || state.agendaLines?.length !== 3) throw new AppError(400, '完成通知の情報が不足しています。');
+    const content = `@everyone\nMTG日時: ${jst(state.meetingAt ?? state.runAt)} JST\n${notificationText(state.title)} の資料が完成しました。\n${state.url}\n議題の要約:\n${state.agendaLines.map(line => `・${notificationText(line)}`).join('\n')}${state.skipped ? '\n※取得できなかったチャンネル・スレッドがあります。' : ''}`;
+    state.notificationAttempted = true; this.save(state);
+    await this.ctx.storage.sync();
+    const response = await fetch(`https://discord.com/api/v10/channels/${state.channel}/messages`, {
+      method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(20_000),
+      headers: { Authorization: `Bot ${this.env.DISCORD_BOT_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content, allowed_mentions: { parse: ['everyone'] }, nonce: state.id, enforce_nonce: true }),
+    });
+    if (response.status === 429) {
+      const body = await response.json() as { retry_after?: number };
+      state.notificationAttempted = false; this.save(state);
+      throw new DiscordError(429, 0, Math.max(1, Math.ceil(body.retry_after ?? 5)));
+    }
+    if (response.status >= 400 && response.status < 500) {
+      await response.body?.cancel(); state.notificationAttempted = false; this.save(state);
+      throw new AppError(403, `Docsは完成しましたが通知できませんでした（HTTP ${response.status}）。Botの送信・全員メンション権限を確認してください。`);
+    }
+    if (!response.ok) { await response.body?.cancel(); throw new Error('NotificationUncertain'); }
+    const result = await response.json() as { id?: string; mention_everyone?: boolean };
+    if (!result.id) throw new Error('NotificationUncertain');
+    state.notificationId = result.id;
+    state.status = result.mention_everyone ? 'complete' : 'notification_failed';
+    if (!result.mention_everyone) state.error = '通知は投稿されましたが全員メンションが無効でした。Botに全員メンション権限を設定してください。';
+    this.save(state);
+  }
   async alarm(): Promise<void> {
     const state = this.state();
     if (!state || terminal.has(state.status)) { await this.ctx.storage.deleteAlarm(); return; }
@@ -239,6 +286,8 @@ export class MeetingScheduler extends DurableObject<Env> {
       } else if (phase === 'preparing') this.prepare(state);
       else if (phase === 'adding') await this.addTab(state);
       else if (phase === 'writing') await this.writePart(state);
+      else if (phase === 'summarizing') await this.summarize(state);
+      else if (phase === 'notifying') await this.notify(state);
       state.failures = 0; this.save(state);
       if (terminal.has(state.status)) await this.ctx.storage.deleteAlarm();
       else await this.ctx.storage.setAlarm(Date.now() + (state.status === 'writing' ? 1500 : 1000));
@@ -252,9 +301,11 @@ export class MeetingScheduler extends DurableObject<Env> {
         const limited = error instanceof DiscordError && error.httpStatus === 429;
         if (!limited) state.failures++;
         const permanent = error instanceof AppError && [400, 401, 403, 409].includes(error.status);
-        if (unsafe || permanent || state.failures >= 6) {
-          state.status = unsafe ? 'needs_review' : 'failed'; state.finished = Date.now();
-          state.error = error instanceof AppError ? error.message : '処理が中断しました。権限と作成済みドキュメントを確認してください。';
+        if (unsafe || permanent || state.failures >= 6 || state.notificationAttempted) {
+          state.status = state.status === 'notifying' && state.notificationAttempted ? 'notification_review'
+            : ['summarizing', 'notifying'].includes(state.status) ? 'notification_failed' : unsafe ? 'needs_review' : 'failed'; state.finished = Date.now();
+          state.error = state.status === 'notification_review' ? 'Docsは完成しましたが通知の送信結果が不明です。通知先チャンネルを確認してください。'
+            : error instanceof AppError ? error.message : '処理が中断しました。権限と作成済みドキュメントを確認してください。';
         }
       }
       this.save(state);

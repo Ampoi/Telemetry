@@ -40,15 +40,32 @@ DiscordのInteractionsには公開HTTPS URLが必要です。ローカル動作�
 サーバー管理権限を持つ利用者が、`/auth` と `/document document:保存先URL` を実行してから予約します。
 
 ```text
-/mtg schedule datetime:2026-09-16 10:00 title:定例MTG
+/mtg schedule
 /mtg status
 /mtg status id:予約ID
 /mtg cancel id:予約ID
 ```
 
-- `datetime` は日本時間の `YYYY-MM-DD HH:mm`。現在より後、366日以内を指定します。
-- **指定時刻は処理開始時刻**です。Cloudflareの実行遅延・履歴量・API制限により完了は後になります。
-- 各予約はサーバー内でBotが取得できる**全履歴（投稿作成時刻が予約時刻より前のもの）**を毎回読み直します。前回からの差分方式ではありません。
+- `/mtg schedule` は引数なし。本人限定の返信の「日程調整を開く」ボタンからWebへ進みます。
+- Discordログイン後、主催者が他の参加者のユーザーID・メンション、タイトル、所要時間（30・60・90・120分、既定60分）を指定して募集を開始。主催者を含む2〜50人の同一サーバーのメンバーが対象です。Botは除外し、参加者は募集開始後に固定します。
+- 作成日のJST日付から5〜9日後（7日後の前後2日、合計5日間）の0:00〜24:00を表示。30分単位でクリック・ドラッグ、またはTabとSpaceで空き時間を選択し保存します。招待リンクをコピーして参加者に共有してください。
+- 全員が回答し、所要時間の連続した共通枠ができたら自動確定。未回答を空き扱いしません。空き時間なしの回答も保存でき、共通枠がなければ修正して調整を続けます。
+- 複数候補は7日後に近い日、同距離なら早い日、その日の早い時刻を優先。日付をまたぐ枠、確定時点から1時間以内の枠を除外します。確定後の回答変更はできません。
+- 確定日時を元チャンネルへメンションなしで通知し、既存の資料作成予約へ接続します。通知失敗でも予約は維持。結果が不明な通知は自動再送せずWebに確認案内を表示します。
+- `/mtg status` は募集状況・リンクと確定済み予約を表示。募集は主催者が `/mtg cancel id:調整ID` で取り消せます。候補期間を過ぎた募集は終了します。
+
+#### 日程調整のDiscordログイン設定
+
+1. Discord Developer Portal → OAuth2 → Redirectsに `APP_ORIGIN + /mtg/login/callback` を登録（本番: `https://telemetry.tange-toshihiro.workers.dev/mtg/login/callback`）。
+2. OAuth2 Client Secretを `pnpm exec wrangler secret put DISCORD_CLIENT_SECRET` で登録します。Bot Tokenとは別の値です。ローカルは `.dev.vars` に設定します。
+3. 追加D1マイグレーション `0009` の適用、Workerデプロイ（新しいMeetingPoll Durable Objectを含む）、Discordコマンド定義の更新が必要です。既存予約は保持されます。
+
+認証スコープは `identify` のみ。stateをブラウザCookieに結び付けて使い捨てにします。セッションCookieはHttpOnly・SameSite=Lax・本番Secure、24時間有効。D1にはセッショントークンのハッシュを保存し、Discord access/refresh tokenは保存しません。APIで現在のサーバー所属を確認し、参加者だけが閲覧、本人だけが回答を変更できます。変更APIは同一Originを要求し、主催者の設定・取消時に管理権限を再確認します。
+
+#### 日時確定後の資料作成
+
+- **指定時刻はMTGの開始日時**です。その1時間前に収集・Docs作成を開始します。1時間を切った予約は受付直後に開始します。実行遅延・履歴量・API制限によりMTG開始までの完成は保証されません。
+- 各予約はサーバー内でBotが取得できる**全履歴（投稿作成時刻が収集開始予定時刻より前のもの）**を毎回読み直します。前回からの差分方式ではありません。
 - テキスト・アナウンス・フォーラム・メディア、ボイス／ステージのテキスト履歴とスレッドが対象です。アクティブ・公開アーカイブ・参加済み非公開アーカイブに加え、権限があれば未参加の非公開アーカイブも取得します。
 - 自分自身のBot以外のBot・Webhook投稿も含めます。権限のない取得処理はスキップ数に記録し、通信障害や429では再試行します。Message Content Intentが無効なら本文欠落を避けるため停止します。
 - 投稿作成日時順に、投稿者・チャンネル名・本文・返信先・元投稿リンク・添付リンクを記録します。Markdownの記号はそのまま残します。
@@ -56,7 +73,11 @@ DiscordのInteractionsには公開HTTPS URLが必要です。ローカル動作�
 - 本文は最大12,000 UTF-16単位ごとに分割して**同じ新規タブ**へ追記し、50,000文字を超えても省略しません。Google Docs自体の上限や編集権限エラーでは停止し、作成済みURLを表示します。
 - 予約者の管理権限を実行時とタブ作成前に再確認します。保存先ドキュメントは予約受付時点のものに固定します。
 - 予約IDはDiscord Interaction IDです。再配信で予約やタブを増やしません。結果が不明なGoogle書き込みは自動再送せず`needs_review`で停止します。
+- 完成後、予約したチャンネルへBotが `@everyone` 付きでMTG日時（JST）・Docsリンク・議題の3行要約を送信します。Botには送信と全員メンションの権限が必要です。予約の受付返信は本人限定でメンションしません。
+- 要約にはWorkerのSecret `OPENAI_API_KEY` と変数 `MTG_SUMMARY_MODEL`（例: `gpt-5-mini`）を設定します。`pnpm exec wrangler secret put OPENAI_API_KEY` で登録し、モデルは `wrangler.jsonc` のvarsに指定してください。収集テキストを分割してOpenAI APIへ送り、前の要約と統合します（API利用料が発生）。画像・動画の内容は解析しません。空履歴では議題がないことを通知します。
+- 要約・通知が失敗しても完成済みDocsは保持し、`/mtg status` に失敗とURLを表示します。送信結果が不明な場合は全員メンションの重複を避けて自動再送を止め、通知先の確認を案内します。429は待機して再試行します。
 - 取消できるのは未開始の予約だけです。予約・完了・失敗・URLは本人限定の`/mtg status`で確認します。将来の実行に期限切れのInteraction返信tokenを使いません。
+- この変更前の予約は旧時刻・旧動作を維持します。新動作にする場合は未開始予約を取り消して再予約してください。本番反映には追加マイグレーション `0008`、Workerデプロイ、Discordコマンド定義の更新が必要です。
 - 予約ごとのDurable ObjectのSQLiteに履歴と書き込み進捗を永続化し、アラームで続行します。長期停止は7日で打ち切ります。実行完了後はアラームを解除します。
 - 取得後に元投稿を編集・削除しても、作成済みDocsや予約の収集結果は自動更新されません。取得時点の内容であり、過去の編集リビジョンの復元や音声の録音は行いません。
 
@@ -233,3 +254,21 @@ pnpm run build
 - [Discord Message API](https://docs.discord.com/developers/resources/message)
 - [Durable Objects Alarms](https://developers.cloudflare.com/durable-objects/api/alarms/)
 - [Google Docs画像挿入](https://developers.google.com/workspace/docs/api/reference/rest/v1/documents/request#InsertInlineImageRequest)
+
+## Botのサーバープロフィール
+
+サーバー内でBotのプロフィールを開くと、保存先ドキュメントURLと接続Googleメールアドレスを表示します。Google未接続・保存先未設定はそれぞれ「設定されてないです」と表示します。これは登録状況であり、現在の編集権限やトークンの有効性はDocs作成時に確認します。
+
+共通プロフィールの「自己紹介」はDiscordアプリの `description` も同期します。保存先とGoogle接続が揃ったサーバーがない間は「設定されてないです」と表示し、設定済みのサーバーがあれば `/document` の案内に切り替えます。共通欄には各サーバーのURL・メールを掲載しません。共通欄が空になった場合も次回同期で修復します。
+
+- `/auth` 完了と `/document` 設定・照会で自動同期します。接続情報はサーバーごとに分離し、そのサーバーのメンバーに公開されます。
+- OAuthに `openid email` を追加しました。既存接続・メール情報の取得失敗時は「接続済み・メール未取得」と表示し、`/auth` の再実行で取得します。
+- `0007_discord_profiles.sql` を適用してからデプロイしてください。Workerの `DISCORD_BOT_TOKEN` が必要です。
+- 初回表示や更新失敗後の再同期は `pnpm run discord:profile --guild SERVER_ID --base-url https://YOUR_WORKER --env-file .dev.vars`。`--status` で接続情報・最終同期時刻・同期エラーを確認できます。APIは管理用Bearer認証必須です。
+- プロフィール更新はDocs Queueで直列実行し、実行時の最新情報を読みます。同じ内容は再送せず、Discordの429では待ち時間を尊重して再試行します。Queueの再試行上限後はコマンドから再同期してください。
+- 新しく招待したサーバーでは `/auth`・`/document` または上記CLIの初回実行で表示を初期化します。参加イベントの自動検知は行いません。
+- URLとメールが190文字に収まらない場合は、途中で切らず `/document` の確認案内を表示します。
+
+参照: [Discordのサーバープロフィール更新API](https://docs.discord.com/developers/resources/guild#modify-current-member)、[Googleのメール情報取得](https://developers.google.com/identity/openid-connect/openid-connect#obtaininguserprofileinformation)。
+
+2026-09-15検証: プロフィール変更を分離した作業コピーで `pnpm run check` 成功（Worker等76件、collector33件）。本番へマイグレーション0007とWorker版 `ca065131-e7c7-4566-9644-cf6ac0beec04` を反映し、参加中2サーバーのプロフィール同期完了・エラーなしを確認しました。既存接続のメールは未取得のため再認証が必要です。メール取得の実Google同意フローは利用者による確認が残ります。

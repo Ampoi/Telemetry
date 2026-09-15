@@ -1,7 +1,8 @@
 import { encrypt, hash, randomToken } from './crypto';
 import { AppError } from './errors';
-import { DOCS_SCOPE, exchangeToken } from './google';
+import { DOCS_SCOPE, LOGIN_SCOPE, accountEmail, exchangeToken } from './google';
 import { connectedPage } from './auth-page';
+import { refreshProfile } from './discord-profile';
 
 export function appOrigin(env: Env): string {
   const url = new URL(env.APP_ORIGIN);
@@ -47,7 +48,7 @@ export async function startLogin(request: Request, env: Env): Promise<Response> 
   url.search = new URLSearchParams({
     client_id: env.GOOGLE_CLIENT_ID,
     redirect_uri: `${appOrigin(env)}/auth/callback`,
-    response_type: 'code', scope: DOCS_SCOPE, access_type: 'offline', prompt: 'consent',
+    response_type: 'code', scope: LOGIN_SCOPE, access_type: 'offline', prompt: 'consent',
     state, code_challenge: await hash(row.verifier), code_challenge_method: 'S256',
   }).toString();
   return new Response(null, { status: 302, headers: {
@@ -61,7 +62,7 @@ function cookie(value: string, env: Env, age: number, name: string) {
   return `${name}=${value}; HttpOnly; SameSite=Lax; Path=${path}; Max-Age=${age}${appOrigin(env).startsWith('https:') ? '; Secure' : ''}`;
 }
 
-export async function finishLogin(request: Request, env: Env): Promise<Response> {
+export async function finishLogin(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const params = new URL(request.url).searchParams;
   const state = params.get('state');
   if (!state) throw new AppError(400, '認証状態を確認できません。URLを開いた同じブラウザで認証してください。');
@@ -87,11 +88,13 @@ export async function finishLogin(request: Request, env: Env): Promise<Response>
     if (!tokens.refresh_token || !tokens.scope?.split(' ').includes(DOCS_SCOPE)) {
       throw new AppError(400, 'ドキュメント編集の許可または継続アクセスのトークンがありません。/auth または pnpm demo auth で編集を許可してください。');
     }
+    const email = await accountEmail(tokens);
     await env.DB.batch([
-      env.DB.prepare("INSERT INTO credentials (id, encrypted_refresh_token, connected_at) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET encrypted_refresh_token = excluded.encrypted_refresh_token, connected_at = excluded.connected_at")
-        .bind(row.owner, await encrypt(tokens.refresh_token, env.TOKEN_ENCRYPTION_KEY, row.owner), Date.now()),
+      env.DB.prepare("INSERT INTO credentials (id, encrypted_refresh_token, connected_at, email) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET encrypted_refresh_token = excluded.encrypted_refresh_token, connected_at = excluded.connected_at, email = excluded.email")
+        .bind(row.owner, await encrypt(tokens.refresh_token, env.TOKEN_ENCRYPTION_KEY, row.owner), Date.now(), email),
       env.DB.prepare("UPDATE auth_requests SET status = 'complete', verifier = '' WHERE id = ?").bind(row.id),
     ]);
+    if (row.owner.startsWith('discord:guild:')) refreshProfile(env, ctx, row.owner.slice('discord:guild:'.length));
     const nonce = randomToken();
     return new Response(connectedPage(row.owner, nonce), {
       headers: {

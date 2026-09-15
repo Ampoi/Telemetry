@@ -14,6 +14,7 @@
     "dev": "wrangler dev --ip localhost --port 8787",
     "demo": "tsx scripts/cli.ts",
     "discord:register": "tsx scripts/register-discord.ts",
+    "discord:profile": "tsx scripts/discord-profile.ts",
     "db:local": "wrangler d1 migrations apply telemetry --local",
     "db:remote": "wrangler d1 migrations apply telemetry --remote",
     "types": "wrangler types",

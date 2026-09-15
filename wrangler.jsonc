@@ -30,10 +30,11 @@
     ]
   },
   "durable_objects": { "bindings": [
+    { "name": "MEETING_POLLS", "class_name": "MeetingPoll" },
     { "name": "MEETINGS", "class_name": "MeetingScheduler" },
     { "name": "COLLECTION_RECOVERY", "class_name": "CollectionRecovery" }
   ] },
-  "migrations": [{ "tag": "v1-meeting-alarms", "new_sqlite_classes": ["MeetingScheduler", "CollectionRecovery"] }],
+  "migrations": [{ "tag": "v1-meeting-alarms", "new_sqlite_classes": ["MeetingScheduler", "CollectionRecovery"] }, { "tag": "v2-meeting-polls", "new_sqlite_classes": ["MeetingPoll"] }],
   "triggers": { "crons": [] },
   // OAuth query strings and credentials must not appear in invocation logs.
   "observability": { "enabled": false }

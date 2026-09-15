@@ -23,6 +23,11 @@ const documentB = 'other_document_67890';
 const discordReplies: { token: string; content: string; allowed_mentions: { parse: string[] } }[] = [];
 const docAccessTokens: string[] = [];
 const docWritePaths: string[] = [];
+const profiles = new Map<string, string>();
+let profileFailures = 0;
+let profileAttempts = 0;
+let appDescription = '';
+let emailAvailable = true;
 let interactionSequence = 0n;
 
 before(async () => {
@@ -31,12 +36,13 @@ before(async () => {
     compatibilityDate: '2026-09-11', compatibilityFlags: ['nodejs_compat'],
     d1Databases: ['DB'],
     queueProducers: { DISCORD_JOBS: 'docs-discord-jobs' },
-    queueConsumers: { 'docs-discord-jobs': { maxBatchSize: 1, maxBatchTimeout: 0, maxRetries: 2 } },
+    queueConsumers: { 'docs-discord-jobs': { maxBatchSize: 1, maxBatchTimeout: 0, maxRetries: 2, maxConcurrency: 1 } },
     bindings: {
       APP_ORIGIN: 'http://localhost:8787', DEMO_API_KEY: API_KEY,
       GOOGLE_CLIENT_ID: 'test-client', GOOGLE_CLIENT_SECRET: 'test-secret',
       TOKEN_ENCRYPTION_KEY: Buffer.alloc(32, 1).toString('base64url'),
       DISCORD_APPLICATION_ID: discordApplicationId,
+      DISCORD_BOT_TOKEN: 'test-bot-token',
       DISCORD_PUBLIC_KEY: Buffer.from(discordKeys.publicKey.export({ format: 'jwk' }).x!, 'base64url').toString('hex'),
     },
     outboundService: async request => {
@@ -48,10 +54,15 @@ before(async () => {
         if (params.get('grant_type') === 'authorization_code') {
           assert.equal(await hash(params.get('code_verifier')!), expectedChallenge);
           assert.equal(params.get('redirect_uri'), 'http://localhost:8787/auth/callback');
-          return MockResponse.json({ access_token: 'test-access', refresh_token: params.get('code') === 'test-code-b' ? 'test-refresh-b' : 'test-refresh', expires_in: 3600, scope: 'https://www.googleapis.com/auth/documents' });
+          return MockResponse.json({ access_token: params.get('code') === 'test-code-b' ? 'test-access-b' : 'test-access', refresh_token: params.get('code') === 'test-code-b' ? 'test-refresh-b' : 'test-refresh', expires_in: 3600, scope: 'https://www.googleapis.com/auth/documents openid email' });
         }
         assert.ok(['test-refresh', 'test-refresh-b'].includes(params.get('refresh_token')!));
         return MockResponse.json({ access_token: params.get('refresh_token') === 'test-refresh-b' ? 'test-access-b' : 'test-access', expires_in: 3600 });
+      }
+      if (url.href === 'https://openidconnect.googleapis.com/v1/userinfo') {
+        if (!emailAvailable) return MockResponse.json({ error: 'unavailable' }, { status: 503 });
+        assert.ok(['Bearer test-access', 'Bearer test-access-b'].includes(request.headers.get('Authorization')!));
+        return MockResponse.json({ email: request.headers.get('Authorization') === 'Bearer test-access-b' ? 'second@example.com' : 'first@example.com', email_verified: true });
       }
       if (url.origin === 'https://docs.googleapis.com') {
         const authorization = request.headers.get('Authorization')!;
@@ -67,7 +78,28 @@ before(async () => {
         return MockResponse.json({ replies: body.requests.map(() => ({})) });
       }
       if (url.origin === 'https://discord.com') {
+        if (url.pathname === '/api/v10/applications/@me') {
+          assert.equal(request.headers.get('Authorization'), 'Bot test-bot-token');
+          if (request.method === 'PATCH') {
+            const body = await request.json() as { description: string };
+            assert.deepEqual(Object.keys(body), ['description']);
+            assert.ok(!body.description.includes('@example.com'));
+            assert.ok(!body.description.includes('https://docs.google.com/'));
+            appDescription = body.description;
+          } else assert.equal(request.method, 'GET');
+          return MockResponse.json({ description: appDescription });
+        }
         assert.equal(request.method, 'PATCH');
+        if (url.pathname.endsWith('/members/@me')) {
+          assert.equal(request.headers.get('Authorization'), 'Bot test-bot-token');
+          profileAttempts++;
+          if (profileFailures-- > 0) return MockResponse.json({ retry_after: 1, code: 0 }, { status: 429 });
+          const body = await request.json() as { bio: string };
+          assert.deepEqual(Object.keys(body), ['bio']);
+          assert.ok(body.bio.length <= 190);
+          profiles.set(url.pathname.split('/')[4], body.bio);
+          return MockResponse.json({ bio: body.bio });
+        }
         assert.ok(url.pathname.endsWith('/messages/@original'));
         const body = await request.json() as { content: string; allowed_mentions: { parse: string[] } };
         discordReplies.push({ token: url.pathname.split('/')[5], ...body });
@@ -77,7 +109,7 @@ before(async () => {
     },
   }));
   const db = await mf.getD1Database('DB');
-  for (const file of ['0001_initial.sql', '0002_discord_users.sql', '0003_collector_commands.sql', '0004_discord_guild_settings.sql']) {
+  for (const file of ['0001_initial.sql', '0002_discord_users.sql', '0003_collector_commands.sql', '0004_discord_guild_settings.sql', '0007_discord_profiles.sql']) {
     const migration = await readFile(`migrations/${file}`, 'utf8');
     for (const sql of migration.split(';').map(v => v.trim()).filter(Boolean)) await db.prepare(sql).run();
   }
@@ -143,7 +175,7 @@ async function beginLogin() {
   assert.equal(started.status, 302);
   const googleUrl = new URL(started.headers.get('Location')!);
   assert.equal(googleUrl.origin, 'https://accounts.google.com');
-  assert.equal(googleUrl.searchParams.get('scope'), 'https://www.googleapis.com/auth/documents');
+  assert.equal(googleUrl.searchParams.get('scope'), 'https://www.googleapis.com/auth/documents openid email');
   assert.equal(googleUrl.searchParams.get('code_challenge_method'), 'S256');
   expectedChallenge = googleUrl.searchParams.get('code_challenge')!;
   const cookie = started.headers.get('Set-Cookie')!.split(';')[0];
@@ -508,4 +540,68 @@ test('同じブラウザで複数サーバーとCLIを認証してもCookieを�
     assert.equal(await decrypt(row!.encrypted_refresh_token, Buffer.alloc(32, 1).toString('base64url'), login.owner), i === 1 ? 'test-refresh-b' : 'test-refresh');
   }
   assert.equal(await db.prepare('SELECT id FROM credentials WHERE id = ?').bind('discord:guild:999999999999999999').first(), null);
+});
+
+test('サーバープロフィールを未接続から認証・保存先変更まで自動同期する', async () => {
+  const guild = '678901234567890123';
+  const db = await mf.getD1Database('DB');
+  const status = async () => await (await api(`/api/discord/profile?guild=${guild}`)).json() as { email: string | null; connected: boolean; sync: { error: string | null; synced_at: number | null } | null };
+  const waitProfile = async (pattern: RegExp) => {
+    const deadline = Date.now() + 12000;
+    while (Date.now() < deadline) {
+      if (pattern.test(profiles.get(guild) ?? '') && (await status()).sync?.synced_at) return;
+      await sleep(30);
+    }
+    assert.fail(`プロフィールが更新されませんでした: ${JSON.stringify({ bio: profiles.get(guild), status: await status(), profiles: [...profiles], profileAttempts })}`);
+  };
+  assert.equal((await mf.dispatchFetch(`http://localhost:8787/api/discord/profile?guild=${guild}`, { method: 'POST' })).status, 401);
+  assert.equal((await api('/api/discord/profile?guild=bad', 'POST')).status, 400);
+  const others = new Map(profiles);
+  assert.equal((await api(`/api/discord/profile?guild=${guild}`, 'POST')).status, 202);
+  await waitProfile(/Google: 設定されてないです.*\nDocs: 設定されてないです/);
+  assert.ok(appDescription.trim(), 'common About Me must not remain blank');
+  for (const [id, bio] of others) assert.equal(profiles.get(id), bio);
+
+  await discordLogin(discordUserA, 'test-code', guild);
+  await waitProfile(/first@example.com/);
+  assert.equal((await status()).email, 'first@example.com');
+  await discordRequest(discordPayload('document', discordUserA, [{ name: 'document', type: 3, value: document }], guild));
+  await waitProfile(new RegExp(document));
+  assert.ok(profiles.get(guild)!.includes('first@example.com'));
+
+  await discordLogin(discordUserB, 'test-code-b', guild);
+  await waitProfile(/second@example.com/);
+  assert.ok(!profiles.get(guild)!.includes('first@example.com'));
+  const displayed = await (await discordRequest(discordPayload('document', discordUserA, [], guild))).json() as { data: { content: string } };
+  assert.match(displayed.data.content, /second@example.com/);
+  assert.match(displayed.data.content, new RegExp(document));
+
+  emailAvailable = false;
+  try { await discordLogin(discordUserA, 'test-code', guild); }
+  finally { emailAvailable = true; }
+  await waitProfile(/接続済み・メール未取得/);
+  assert.equal((await status()).email, null);
+  assert.equal((await status()).connected, true);
+
+  // A Discord 429 must retry without losing the newly saved document.
+  profileFailures = 1;
+  const attempts = profileAttempts;
+  await discordRequest(discordPayload('document', discordUserA, [{ name: 'document', type: 3, value: documentB }], guild));
+  await waitProfile(new RegExp(documentB));
+  assert.ok(profileAttempts >= attempts + 2);
+  assert.equal((await status()).sync?.error, null);
+
+  const count = profileAttempts;
+  appDescription = '';
+  await api(`/api/discord/profile?guild=${guild}`, 'POST');
+  const descriptionDeadline = Date.now() + 8000;
+  while (!appDescription && Date.now() < descriptionDeadline) await sleep(30);
+  assert.ok(appDescription.trim(), 'repair common About Me even when the guild bio is cached');
+  assert.equal(profileAttempts, count, 'unchanged profile must not PATCH again');
+
+  // A credential removal must also clear the account on the next sync.
+  await db.prepare('DELETE FROM credentials WHERE id = ?').bind(`discord:guild:${guild}`).run();
+  await api(`/api/discord/profile?guild=${guild}`, 'POST');
+  await waitProfile(/Google: 設定されてないです/);
+  assert.ok(profiles.get(guild)!.includes(documentB));
 });

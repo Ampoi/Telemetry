@@ -16,6 +16,7 @@ const keys = generateKeyPairSync('ed25519');
 let mf: Miniflare, sequence = 0n;
 let cutoff: number, messages: RemoteMessage[], writes: {requests:Record<string,any>[]}[], replies: string[];
 let historyPaths: string[], imageStatus: number, textStatus: number, addStatus: number, rateOnce: boolean, revoked: boolean, contentIntent: boolean;
+let notifications: any[], notifyStatus: number, summaryStatus: number, summaryInputs: any[];
 const newId = () => ((BigInt(Date.now() - 1420070400000) << 22n) + ++sequence).toString();
 function message(channel: string, at: number, text: string, extra: Partial<RemoteMessage> = {}): RemoteMessage {
   return {id:(BigInt(snowflake(at)) + ++sequence).toString(),channel_id:channel,timestamp:new Date(at).toISOString(),edited_timestamp:null,content:text,author:{id:user,username:'tester'},attachments:[],...extra};
@@ -31,12 +32,12 @@ async function book(title = '予約テスト') {
 async function finish(id: string) {
   for(let i=0;i<100;i++){
     const s=await harness('step',id);
-    if(['complete','failed','needs_review','cancelled'].includes(s.status))return s;
+    if(['complete','failed','needs_review','cancelled','notification_failed','notification_review'].includes(s.status))return s;
   }
   assert.fail('Meeting did not complete');
 }
 function interaction(action: string, options: {name:string;type:number;value:string}[] = []) {
-  return {id:newId(),type:2,application_id:bot,token:'test-reply',guild_id:guild,member:{user:{id:user},permissions:'32'},data:{name:'mtg',options:[{name:action,type:1,options}]}};
+  return {id:newId(),type:2,application_id:bot,token:'test-reply',guild_id:guild,channel_id:root,member:{user:{id:user},permissions:'32'},data:{name:'mtg',options:[{name:action,type:1,options}]}};
 }
 async function signed(payload: unknown) {
   const body=JSON.stringify(payload),timestamp=String(Math.floor(Date.now()/1000));
@@ -50,10 +51,14 @@ before(async()=>{
   mf=new Miniflare(convertV4MiniflareOptions({
     name:'meeting-test',modules:true,scriptPath:'.test-dist/cloud-harness.js',compatibilityDate:'2026-09-15',compatibilityFlags:['nodejs_compat'],
     d1Databases:['DB'],r2Buckets:['MEDIA'],queueProducers:{DISCORD_JOBS:'meeting-docs',COLLECTION_JOBS:'meeting-collection'},
-    durableObjects:{MEETINGS:{className:'TestMeetingScheduler',useSQLite:true},COLLECTION_RECOVERY:{className:'CollectionRecovery',useSQLite:true}},
-    bindings:{APP_ORIGIN:'http://localhost:8787',DEMO_API_KEY:apiKey,COLLECTION_MODE:'cloud',GOOGLE_CLIENT_ID:'test-client',GOOGLE_CLIENT_SECRET:'test-secret',TOKEN_ENCRYPTION_KEY:key,DISCORD_BOT_TOKEN:'fake-bot',DISCORD_APPLICATION_ID:bot,DISCORD_PUBLIC_KEY:Buffer.from(keys.publicKey.export({format:'jwk'}).x!,'base64url').toString('hex')},
+    durableObjects:{MEETING_POLLS:{className:'MeetingPoll',useSQLite:true},MEETINGS:{className:'TestMeetingScheduler',useSQLite:true},COLLECTION_RECOVERY:{className:'CollectionRecovery',useSQLite:true}},
+    bindings:{OPENAI_API_KEY:'fake-openai',MTG_SUMMARY_MODEL:'test-model',APP_ORIGIN:'http://localhost:8787',DEMO_API_KEY:apiKey,COLLECTION_MODE:'cloud',GOOGLE_CLIENT_ID:'test-client',GOOGLE_CLIENT_SECRET:'test-secret',TOKEN_ENCRYPTION_KEY:key,DISCORD_BOT_TOKEN:'fake-bot',DISCORD_APPLICATION_ID:bot,DISCORD_PUBLIC_KEY:Buffer.from(keys.publicKey.export({format:'jwk'}).x!,'base64url').toString('hex')},
     outboundService:async request=>{
       const u=new URL(request.url);
+      if(u.hostname==='api.openai.com'){
+        summaryInputs.push(await request.json());
+        return summaryStatus===200 ? MockResponse.json({status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify({lines:['進捗の確認 @everyone','課題の相談 @here','次の対応 <@123456789012345678>']})}]}]}) : MockResponse.json({error:{}},{status:summaryStatus});
+      }
       if(u.hostname==='oauth2.googleapis.com')return MockResponse.json({access_token:'test-access',expires_in:3600});
       if(u.hostname==='docs.googleapis.com'){
         assert.equal(u.pathname,`/v1/documents/${document}:batchUpdate`);
@@ -65,6 +70,13 @@ before(async()=>{
       assert.equal(u.hostname,'discord.com');
       if(request.method==='PATCH'){const body=await request.json() as {content:string;allowed_mentions:{parse:string[]}};assert.deepEqual(body.allowed_mentions,{parse:[]});replies.push(body.content);return MockResponse.json({id:'reply'});}
       assert.equal(request.headers.get('Authorization'),'Bot fake-bot');
+      if(request.method==='POST') {
+        assert.equal(u.pathname,`/api/v10/channels/${root}/messages`);
+        notifications.push(await request.json());
+        assert.ok(writes.some(w=>w.requests.some(r=>r.insertText)),'notify only after document writes');
+        return notifyStatus===200 ? MockResponse.json({id:'123456789012345679',mention_everyone:true}) : MockResponse.json({retry_after:2},{status:notifyStatus});
+      }
+      if(u.pathname===`/api/v10/channels/${root}`)return MockResponse.json({id:root,guild_id:guild,type:0,name:'一般'});
       if(u.pathname==='/api/v10/applications/@me')return MockResponse.json({flags:contentIntent?1<<19:0});
       if(u.pathname===`/api/v10/guilds/${guild}`)return MockResponse.json({owner_id:revoked?'999999999999999999':user});
       if(u.pathname===`/api/v10/guilds/${guild}/members/${user}`)return MockResponse.json({roles:[]});
@@ -91,6 +103,7 @@ after(async()=>{await mf?.dispose();});
 beforeEach(()=>{
   cutoff=Date.now()-1000;messages=[message(root,Date.parse('2020-01-01T00:00:00Z'),'6年以上前の投稿 {{raw}}\n# この記号を残す')];
   writes=[];replies=[];historyPaths=[];imageStatus=textStatus=addStatus=200;rateOnce=revoked=false;contentIntent=true;
+  notifications=[];summaryInputs=[];notifyStatus=summaryStatus=200;
 });
 
 test('strict JST datetime, impossible dates, raw text and UTF-16 chunk boundaries',()=>{
@@ -152,17 +165,73 @@ test('missing Message Content Intent fails instead of silently creating an empty
   contentIntent=false;const input=await book();await harness('due',input.id,{runAt:cutoff});const result=await finish(input.id);assert.equal(result.status,'failed');assert.match(result.error,/Message Content Intent/);assert.equal(writes.length,0);
 });
 test('signed /mtg rejects DMs and non-managers, persists reservations, isolates guilds and cancels',async()=>{
-  const options=[{name:'datetime',type:3,value:jst(Date.now()+3600_000)}];
-  const payload=interaction('schedule',options);
+  const payload=interaction('schedule');
   for(const p of [{...payload,guild_id:undefined},{...payload,member:{user:{id:user},permissions:'0'}}]){
     const r=await signed(p);const b=await r.json() as any;assert.equal(b.type,4);assert.match(b.data.content,/サーバー/);
   }
   const r=await signed(payload);assert.equal((await r.json() as any).type,5);
-  assert.match(await waitReply(0),/予約済み/);
+  assert.match(await waitReply(0),/日程調整を作成/);
+  const input: MeetingInput = {id:payload.id,guild,user,runAt:Date.now()+3600_000,title:'テスト',document};
+  await harness('book',payload.id,{input});
+  await (await mf.getD1Database('DB')).prepare('INSERT INTO meeting_reservations(id,guild,user,run_at,title,document,created) VALUES(?,?,?,?,?,?,?)').bind(payload.id,guild,user,input.runAt,input.title,document,Date.now()).run();
   const row=await(await mf.getD1Database('DB')).prepare('SELECT guild,document FROM meeting_reservations WHERE id=?').bind(payload.id).first();assert.deepEqual(row,{guild,document});
   const n=replies.length;await signed({...interaction('status',[{name:'id',type:3,value:payload.id}]),guild_id:'999999999999999999'});assert.match(await waitReply(n),/見つかりません/);
   const n2=replies.length;await signed(interaction('cancel',[{name:'id',type:3,value:payload.id}]));assert.match(await waitReply(n2),/取消済み/);
 });
 test('no Cron schedules remain in production configuration',async()=>{
   const source=await readFile('wrangler.jsonc','utf8');assert.match(source,/"crons":\s*\[\]/);
+});
+
+async function notificationBooking() {
+  const meetingAt=Date.now()+7200_000;
+  const input: MeetingInput={id:newId(),guild,user,runAt:meetingAt-3600_000,meetingAt,channel:root,title:'定例 @everyone',document};
+  await harness('book',input.id,{input});return input;
+}
+test('new meeting starts one hour before MTG and notifies once with three inert summary lines after Docs completion',async()=>{
+  const input=await notificationBooking();
+  assert.equal(await harness('alarm',input.id),input.meetingAt!-3600_000);
+  assert.equal((await harness('step',input.id)).status,'scheduled');assert.equal(notifications.length,0);
+  await harness('due',input.id,{runAt:cutoff});
+  const result=await finish(input.id);assert.equal(result.status,'complete');
+  assert.equal(notifications.length,1);const sent=notifications[0];
+  assert.deepEqual(sent.allowed_mentions,{parse:['everyone']});assert.equal(sent.nonce,input.id);assert.equal(sent.enforce_nonce,true);
+  assert.equal(sent.content.match(/@everyone/g).length,1);assert.ok(!sent.content.includes('@here'));
+  assert.ok(sent.content.includes(jst(input.meetingAt!)));assert.ok(sent.content.includes(result.url));
+  assert.equal(sent.content.split('\n').filter((x:string)=>x.startsWith('・')).length,3);assert.ok(sent.content.length<=2000);
+  assert.ok(summaryInputs.length>0);assert.equal(summaryInputs[0].store,false);
+  await harness('step',input.id);assert.equal(notifications.length,1);
+});
+test('empty history sends an honest three-line notice without calling AI',async()=>{
+  messages=[];const input=await notificationBooking();await harness('due',input.id,{runAt:cutoff});
+  assert.equal((await finish(input.id)).status,'complete');assert.equal(summaryInputs.length,0);assert.match(notifications[0].content,/議題を抽出できません/);
+});
+test('summary failure preserves the finished document and sends no everyone notification',async()=>{
+  summaryStatus=401;const input=await notificationBooking();await harness('due',input.id,{runAt:cutoff});
+  const result=await finish(input.id);assert.equal(result.status,'notification_failed');assert.ok(result.url);assert.equal(notifications.length,0);
+  assert.equal(writes.filter(w=>w.requests[0].addDocumentTab).length,1);
+});
+test('uncertain notification stops without duplicate mentions or document recreation',async()=>{
+  notifyStatus=503;const input=await notificationBooking();await harness('due',input.id,{runAt:cutoff});
+  assert.equal((await finish(input.id)).status,'notification_review');assert.equal(notifications.length,1);
+  await harness('step',input.id);assert.equal(notifications.length,1);assert.equal(writes.filter(w=>w.requests[0].addDocumentTab).length,1);
+});
+test('notification rate limit retries only the notification, while forbidden stops',async()=>{
+  notifyStatus=429;const input=await notificationBooking();await harness('due',input.id,{runAt:cutoff});
+  for(let i=0;i<100&&!notifications.length;i++)await harness('step',input.id);
+  assert.equal(notifications.length,1);const count=writes.length;
+  notifyStatus=200;assert.equal((await finish(input.id)).status,'complete');assert.equal(writes.length,count);
+  notifyStatus=403;const other=await notificationBooking();await harness('due',other.id,{runAt:cutoff});
+  assert.equal((await finish(other.id)).status,'notification_failed');const n=notifications.length;
+  await harness('step',other.id);assert.equal(notifications.length,n);
+});
+test('signed poll creation is idempotent and legacy datetime arguments are rejected',async()=>{
+  const payload=interaction('schedule');
+  await signed(payload);assert.match(await waitReply(0),/日程調整を作成/);
+  const db=await mf.getD1Database('DB');
+  const row=await db.prepare('SELECT created FROM meeting_polls WHERE id=?').bind(payload.id).first<any>();
+  const n=replies.length;await signed(payload);await waitReply(n);
+  assert.equal((await db.prepare('SELECT created FROM meeting_polls WHERE id=?').bind(payload.id).first<any>()).created,row.created);
+  assert.equal(await db.prepare('SELECT id FROM meeting_reservations WHERE id=?').bind(payload.id).first(),null);
+  const n2=replies.length;await signed(interaction('schedule',[{name:'datetime',type:3,value:jst(Date.now()+1800_000)}]));
+  assert.match(await waitReply(n2),/引数なし/);
 });
