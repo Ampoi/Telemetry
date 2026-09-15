@@ -2,20 +2,21 @@ import { AppError } from './errors';
 import { requireGuildManager } from './discord-guild';
 import type { Interaction } from './discord';
 
-export interface MeetingSettings { center_days: number; radius_days: number; channel_id: string | null }
+export interface MeetingSettings { center_days: number; radius_days: number; channel_id: string | null; voice_channel_id: string | null }
 export async function meetingSettings(env: Env, guild: string): Promise<MeetingSettings> {
-  return await env.DB.prepare('SELECT center_days,radius_days,channel_id FROM guild_meeting_settings WHERE guild_id=?').bind(guild).first<MeetingSettings>()
-    ?? { center_days: 7, radius_days: 2, channel_id: null };
+  return await env.DB.prepare('SELECT center_days,radius_days,channel_id,voice_channel_id FROM guild_meeting_settings WHERE guild_id=?').bind(guild).first<MeetingSettings>()
+    ?? { center_days: 7, radius_days: 2, channel_id: null, voice_channel_id: null };
 }
 export function validateRange(center: number, radius: number): void {
   if (!Number.isInteger(center) || !Number.isInteger(radius) || center < 1 || center > 365 || radius < 0 || radius > 14 || center - radius < 1 || center + radius > 365)
     throw new AppError(400, '中心日は1〜365日後、前後は0〜14日で、候補日が明日〜365日後に収まるよう入力してください。');
 }
 function panel(s: MeetingSettings, saved = false) {
-  return { content: `${saved ? '設定を保存しました。\n\n' : ''}**このサーバーのMTG設定**\n候補日：${s.center_days}日後 ± ${s.radius_days}日（${s.center_days - s.radius_days}〜${s.center_days + s.radius_days}日後・日本時間）\n通知先：${s.channel_id ? `<#${s.channel_id}>` : 'コマンドを実行したチャンネル'}\n変更は次に作成する日程調整から適用されます。募集・日時確定・Docs完成の通知先を共通で設定します。`,
+  return { content: `${saved ? '設定を保存しました。\n\n' : ''}**このサーバーのMTG設定**\n候補日：${s.center_days}日後 ± ${s.radius_days}日（${s.center_days - s.radius_days}〜${s.center_days + s.radius_days}日後・日本時間）\n通知先：${s.channel_id ? `<#${s.channel_id}>` : 'コマンドを実行したチャンネル'}\n通話チャンネル：${s.voice_channel_id ? `<#${s.voice_channel_id}>` : '未設定'}\n通話チャンネルは通知時の設定を使用します。\n変更は次に作成する日程調整から適用されます。募集・日時確定・開始1時間前の通知先を共通で設定します。`,
     flags: 64, allowed_mentions: { parse: [] }, components: [
       { type: 1, components: [{ type: 2, style: 1, label: '候補日の範囲を変更', custom_id: 'settings:range' }] },
       { type: 1, components: [{ type: 8, custom_id: 'settings:channel', channel_types: [0, 5], placeholder: 'MTGの通知チャンネルを選択', min_values: 1, max_values: 1, ...(s.channel_id ? { default_values: [{ id: s.channel_id, type: 'channel' }] } : {}) }] },
+      { type: 1, components: [{ type: 8, custom_id: 'settings:voice-channel', channel_types: [2], placeholder: 'MTGの通話チャンネルを選択', min_values: 1, max_values: 1, ...(s.voice_channel_id ? { default_values: [{ id: s.voice_channel_id, type: 'channel' }] } : {}) }] },
       { type: 1, components: [{ type: 2, style: 2, label: '通知先を実行チャンネルに戻す', custom_id: 'settings:reset-channel' }] },
     ] };
 }
@@ -37,10 +38,10 @@ export async function settingsInteraction(i: Interaction, env: Env, ctx: Executi
     const value = (id: string) => { const v = inputs.find(c => c.custom_id === id)?.value; return typeof v === 'string' && /^\d+$/.test(v) ? Number(v) : NaN; };
     range = { center: value('center'), radius: value('radius') };
     validateRange(range.center, range.radius);
-  } else if (i.type === 3 && action === 'settings:channel') {
+  } else if (i.type === 3 && (action === 'settings:channel' || action === 'settings:voice-channel')) {
     channel = i.data?.values?.[0] ?? null;
     const resolved = channel ? i.data?.resolved?.channels?.[channel] : undefined;
-    if (!channel || !/^\d{17,20}$/.test(channel) || i.data?.values?.length !== 1 || !resolved || ![0, 5].includes(resolved.type)) throw new AppError(400, 'このサーバーのテキストチャンネルを選択してください。');
+    if (!channel || !/^\d{17,20}$/.test(channel) || i.data?.values?.length !== 1 || !resolved || !(action === 'settings:voice-channel' ? [2] : [0, 5]).includes(resolved.type)) throw new AppError(400, action === 'settings:voice-channel' ? 'このサーバーのボイスチャンネルを選択してください。' : 'このサーバーのテキストチャンネルを選択してください。');
   } else if (!(i.type === 3 && action === 'settings:reset-channel')) throw new AppError(400, '/settings を開き直してください。');
   // Acknowledge before database writes; each action changes only its own fields.
   ctx.waitUntil((async () => {
@@ -48,6 +49,8 @@ export async function settingsInteraction(i: Interaction, env: Env, ctx: Executi
     try {
       if (range) await env.DB.prepare('INSERT INTO guild_meeting_settings(guild_id,center_days,radius_days,updated_by,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(guild_id) DO UPDATE SET center_days=excluded.center_days,radius_days=excluded.radius_days,updated_by=excluded.updated_by,updated_at=excluded.updated_at')
         .bind(guild, range.center, range.radius, i.member!.user!.id, Date.now()).run();
+      else if (action === 'settings:voice-channel') await env.DB.prepare('INSERT INTO guild_meeting_settings(guild_id,voice_channel_id,updated_by,updated_at) VALUES(?,?,?,?) ON CONFLICT(guild_id) DO UPDATE SET voice_channel_id=excluded.voice_channel_id,updated_by=excluded.updated_by,updated_at=excluded.updated_at')
+        .bind(guild, channel, i.member!.user!.id, Date.now()).run();
       else await env.DB.prepare('INSERT INTO guild_meeting_settings(guild_id,channel_id,updated_by,updated_at) VALUES(?,?,?,?) ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id,updated_by=excluded.updated_by,updated_at=excluded.updated_at')
         .bind(guild, channel, i.member!.user!.id, Date.now()).run();
       data = panel(await meetingSettings(env, guild), true);

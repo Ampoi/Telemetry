@@ -24,6 +24,10 @@ export function agendaLayout(agenda: Agenda): AgendaBlock[] {
   // Legacy saved results have unlabelled summaries. Preserve their meaning rather
   // than assigning a guessed category during an in-flight deployment.
   for (const p of agenda.summary.filter(p => !labels.some(l => p.text.startsWith(l + '：') || p.text.startsWith(l + ':')))) item([p]);
+  heading('今週の議題', 3);
+  // This overview reuses the detailed discussion titles; evidence and media stay
+  // beside the detailed points below. Keep the heading available for additions.
+  for (const discussion of agenda.discussions) item([{ text: discussion.title, sourceIds: [], mediaIds: [] }]);
   heading('2. 部門・テーマ別の進捗');
   for (const t of agenda.topics) {
     heading(`${t.department}・${t.title}`, 3);

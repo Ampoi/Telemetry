@@ -9,9 +9,9 @@ const guild='456789012345678901', owner='234567890123456789', guest='23456789012
 const origin='http://localhost:8787';
 let mf:Miniflare, serial=100n, notifications:any[]=[], memberListDenied=false;
 const tokens:Record<string,string>={[owner]:'owner-session',[guest]:'guest-session',[outsider]:'outsider-session'};
-async function create(){
+async function create(preferences: { centerDays?: number; radiusDays?: number } = {}){
   const id=(150000000000000000n+serial++).toString();
-  const input={id,guild,user:owner,channel:'567890123456789012',document:'document_123456789',created:Date.now()};
+  const input={id,guild,user:owner,channel:'567890123456789012',document:'document_123456789',created:Date.now(),...preferences};
   await (await mf.getD1Database('DB')).prepare('INSERT INTO meeting_polls(id,guild,user,created) VALUES(?,?,?,?)').bind(id,guild,owner,input.created).run();
   assert.equal((await mf.dispatchFetch(origin+'/test/poll',{method:'POST',body:JSON.stringify({input})})).status,200);
   return id;
@@ -23,7 +23,7 @@ async function configure(id:string){const r=await call(id,'data');assert.equal(r
 before(async()=>{
   mf=new Miniflare(convertV4MiniflareOptions({name:'poll-test',modules:true,scriptPath:'.test-dist/cloud-harness.js',compatibilityDate:'2026-09-15',compatibilityFlags:['nodejs_compat'],
     d1Databases:['DB'],r2Buckets:['MEDIA'],queueProducers:{DISCORD_JOBS:'docs',COLLECTION_JOBS:'collection'},
-    durableObjects:{MEETING_POLLS:{className:'MeetingPoll',useSQLite:true},MEETINGS:{className:'TestMeetingScheduler',useSQLite:true},COLLECTION_RECOVERY:{className:'CollectionRecovery',useSQLite:true}},
+    durableObjects:{MEETING_STARTS:{className:'TestMeetingStart',useSQLite:true},MEETING_POLLS:{className:'MeetingPoll',useSQLite:true},MEETINGS:{className:'TestMeetingScheduler',useSQLite:true},COLLECTION_RECOVERY:{className:'CollectionRecovery',useSQLite:true}},
     bindings:{APP_ORIGIN:origin,DISCORD_CLIENT_SECRET:'fake-secret',DISCORD_APPLICATION_ID:'123456789012345678',DISCORD_BOT_TOKEN:'fake-bot',COLLECTION_MODE:'cloud'},
     outboundService:async request=>{
       const u=new URL(request.url);
@@ -92,6 +92,9 @@ test('OAuth state is cookie-bound and single use; sessions store hashes and logo
   assert.equal((await mf.dispatchFetch(`${origin}/mtg/polls/${id}/data`,{headers:{Cookie:auth}})).status,401);
 });
 test('empty answers remain open and are editable; simultaneous overlap books once and freezes answers',async()=>{
+  const db=await mf.getD1Database('DB');
+  await db.prepare('INSERT INTO meeting_agenda_archives VALUES(?,?,?,?,?,?)').bind('poll-archive',guild,'R-1',1,Date.now()+100*DAY,Date.now()).run();
+  await db.prepare('INSERT INTO meeting_agenda_sources VALUES(?,?)').bind(guild,'poll-archive').run();
   const id=await create();await configure(id);
   await call(id,'answer',owner,{slots:[]});await call(id,'answer',guest,{slots:[114,115]});
   assert.equal((await(await call(id,'data')).json() as any).status,'open');
@@ -101,9 +104,13 @@ test('empty answers remain open and are editable; simultaneous overlap books onc
   for(let i=0;i<150;i++){data=await(await call(id,'data')).json();if(data.status==='confirmed')break;await new Promise(r=>setTimeout(r,20));}
   assert.equal(data.status,'confirmed');assert.equal(data.meetingAt,data.start+114*SLOT);
   assert.equal((await call(id,'answer',guest,{slots:[]})).status,409);
-  const db=await mf.getD1Database('DB');const row=await db.prepare('SELECT * FROM meeting_reservations WHERE id=?').bind(id).first<any>();
-  assert.equal(row.title,meetingTitle(data.meetingAt));assert.equal(row.meeting_at,data.meetingAt);assert.equal(row.run_at,data.meetingAt-3600_000);
-  const status=await mf.dispatchFetch(origin+'/test/meeting/summary',{method:'POST',body:JSON.stringify({id,guild})});assert.equal((await status.json() as any).status,'scheduled');
+  const row=await db.prepare('SELECT * FROM meeting_reservations WHERE id=?').bind(id).first<any>();
+  assert.equal(row.title,meetingTitle(data.meetingAt));assert.equal(row.meeting_at,data.meetingAt);assert.equal(row.run_at,data.meetingAt-7200_000);
+  const status=await mf.dispatchFetch(origin+'/test/meeting/summary',{method:'POST',body:JSON.stringify({id,guild})});
+  const booking=await status.json() as any;assert.equal(booking.status,'scheduled');assert.equal(booking.mode,'agenda');assert.equal(booking.startNotice,true);
+  assert.equal(booking.sourceArchive,'poll-archive');assert.equal(booking.rangeFrom,row.run_at-7*DAY);assert.equal(booking.rangeTo,row.run_at);
+  await db.prepare('DELETE FROM meeting_agenda_sources WHERE guild=?').bind(guild).run();
+  const alarm=await mf.dispatchFetch(origin+'/test/start/alarm',{method:'POST',body:JSON.stringify({id,guild})});assert.equal(await alarm.json(),data.meetingAt-3600_000);
   assert.equal((await db.prepare('SELECT COUNT(*) AS n FROM meeting_reservations WHERE id=?').bind(id).first<any>()).n,1);
 });
 test('owner cancellation prevents further answers and no reservation is created',async()=>{
@@ -153,7 +160,7 @@ test('manual confirmation requires the owner and a valid single slot, books and 
   const notices=notifications.filter(n=>n.nonce===id);assert.equal(notices.length,1);
   assert.match(notices[0].content,/^次のMTG日時は.+（日本時間）です！$/);assert.deepEqual(notices[0].allowed_mentions,{parse:[]});
   const row=await(await mf.getD1Database('DB')).prepare('SELECT meeting_at,run_at FROM meeting_reservations WHERE id=?').bind(id).first<any>();
-  assert.equal(row.meeting_at,data.meetingAt);assert.equal(row.run_at,data.meetingAt-3600_000);
+  assert.equal(row.meeting_at,data.meetingAt);assert.equal(row.run_at,data.meetingAt-7200_000);
 });
 
 test('manual confirmation races with automatic confirmation without overwriting or double notification',async()=>{
@@ -169,4 +176,28 @@ test('manual confirmation races with automatic confirmation without overwriting 
 test('cancelled polls reject manual confirmation',async()=>{
   const id=await create();await configure(id);await call(id,'cancel',owner,{});
   assert.equal((await call(id,'confirm',owner,{slot:114})).status,409);
+});
+
+
+test('custom date range is frozen, spans seven days, and validates the actual last slot', async()=>{
+  const id = await create({centerDays:7,radiusDays:3});
+  const data = await configure(id);
+  assert.equal(data.start, windowStart(Date.now(),7,3));
+  assert.equal(data.days,7);
+  assert.equal(data.counts.length,336);
+  assert.equal((await call(id,'answer',owner,{slots:[335]})).status,200);
+  assert.equal((await call(id,'answer',owner,{slots:[336]})).status,400);
+  assert.equal((await call(id,'confirm',owner,{slot:336})).status,400);
+  assert.equal((await call(id,'confirm',owner,{slot:335})).status,200);
+  const single = await create({centerDays:14,radiusDays:0});
+  const view = await configure(single);
+  assert.equal(view.days,1);
+  assert.equal(view.counts.length,48);
+  assert.equal((await call(single,'answer',owner,{slots:[48]})).status,400);
+});
+test('custom range automatic choice prefers its center and then earlier days',()=>{
+  const p={start:windowStart(Date.now(),7,3),radiusDays:3,members:[{id:owner,name:'Host'}],answers:{[owner]:[0,96,144,192,335]}} as unknown as PollState;
+  assert.equal(commonSlot(p,Date.now()),p.start+144*SLOT);
+  p.answers[owner]=[96,192];
+  assert.equal(commonSlot(p,Date.now()),p.start+96*SLOT);
 });

@@ -19,6 +19,7 @@ let cutoff: number, messages: RemoteMessage[], writes: {requests:Record<string,a
 let historyPaths: string[], imageStatus: number, textStatus: number, addStatus: number, rateOnce: boolean, revoked: boolean, contentIntent: boolean;
 let invitations: any[], invitationStatus: number, invitationMention: boolean;
 let notifications: any[], notifyStatus: number, summaryStatus: number, summaryInputs: any[];
+let previousDocumentText: string | undefined, minutesReads: string[];
 const newId = () => ((BigInt(Date.now() - 1420070400000) << 22n) + ++sequence).toString();
 function message(channel: string, at: number, text: string, extra: Partial<RemoteMessage> = {}): RemoteMessage {
   return {id:(BigInt(snowflake(at)) + ++sequence).toString(),channel_id:channel,timestamp:new Date(at).toISOString(),edited_timestamp:null,content:text,author:{id:user,username:'tester'},attachments:[],...extra};
@@ -38,7 +39,7 @@ async function finish(id: string) {
   }
   assert.fail('Meeting did not complete');
 }
-function interaction(action: string, options: {name:string;type:number;value:string}[] = []) {
+function interaction(action: string, options: {name:string;type:number;value:string | number}[] = []) {
   return {id:newId(),type:2,application_id:bot,token:'test-reply',guild_id:guild,channel_id:root,member:{user:{id:user},permissions:'32'},data:{name:'mtg',options:[{name:action,type:1,options}]}};
 }
 async function signed(payload: unknown) {
@@ -53,23 +54,37 @@ before(async()=>{
   mf=new Miniflare(convertV4MiniflareOptions({
     name:'meeting-test',modules:true,scriptPath:'.test-dist/cloud-harness.js',compatibilityDate:'2026-09-15',compatibilityFlags:['nodejs_compat'],
     d1Databases:['DB'],r2Buckets:['MEDIA'],queueProducers:{DISCORD_JOBS:'meeting-docs',COLLECTION_JOBS:'meeting-collection'},
-    durableObjects:{MEETING_POLLS:{className:'MeetingPoll',useSQLite:true},MEETINGS:{className:'TestMeetingScheduler',useSQLite:true},COLLECTION_RECOVERY:{className:'CollectionRecovery',useSQLite:true}},
+    durableObjects:{MEETING_STARTS:{className:'TestMeetingStart',useSQLite:true},MEETING_POLLS:{className:'MeetingPoll',useSQLite:true},MEETINGS:{className:'TestMeetingScheduler',useSQLite:true},COLLECTION_RECOVERY:{className:'CollectionRecovery',useSQLite:true}},
     bindings:{OPENAI_API_KEY:'fake-openai',MTG_SUMMARY_MODEL:'test-model',APP_ORIGIN:'http://localhost:8787',DEMO_API_KEY:apiKey,COLLECTION_MODE:'cloud',GOOGLE_CLIENT_ID:'test-client',GOOGLE_CLIENT_SECRET:'test-secret',TOKEN_ENCRYPTION_KEY:key,DISCORD_BOT_TOKEN:'fake-bot',DISCORD_APPLICATION_ID:bot,DISCORD_PUBLIC_KEY:Buffer.from(keys.publicKey.export({format:'jwk'}).x!,'base64url').toString('hex')},
     outboundService:async request=>{
       const u=new URL(request.url);
       if(u.hostname==='api.openai.com'){
         const input = await request.json() as any; summaryInputs.push(input);
+        if (input.text.format.name === 'agenda_previous_minutes') {
+          const payload = JSON.parse(input.input[0].content[0].text);
+          return MockResponse.json({status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify({items:[{kind:'todo',text:'電流測定の進捗確認',member:'',deadline:'',evidence:payload.minutes}]})}]}]});
+        }
         if (input.text.format.name === 'weekly_agenda') {
           const payload = JSON.parse(input.input[0].content[0].text);
           const first = payload.messages[0];
-          const point = { text: '構造試験の結果を確認する。', sourceIds: [first.message_id], mediaIds: first.attachments.map((a:any) => a.attachment_id) };
+          const point = payload.previousMinutes
+            ? { text: '前回決定した固定方針と、電流測定の進捗を確認する。', sourceIds: [payload.previousMinutes.items[0].message_id], mediaIds: [] }
+            : { text: '構造試験の結果を確認する。', sourceIds: [first.message_id], mediaIds: first.attachments.map((a:any) => a.attachment_id) };
           return summaryStatus === 200 ? MockResponse.json({status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify({summary:[point],topics:[],discussions:[]})}]}]}) : MockResponse.json({error:{}},{status:summaryStatus});
         }
         return summaryStatus===200 ? MockResponse.json({status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify({lines:['進捗の確認 @everyone','課題の相談 @here','次の対応 <@123456789012345678>']})}]}]}) : MockResponse.json({error:{}},{status:summaryStatus});
       }
       if(u.hostname==='cdn.discordapp.com') return new MockResponse(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZ2cAAAAASUVORK5CYII=','base64'),{headers:{'Content-Type':'image/png'}});
+      if(u.pathname==='/api/v10/channels/567890123456789015') return MockResponse.json({guild_id:guild,type:2});
       if(u.hostname==='oauth2.googleapis.com')return MockResponse.json({access_token:'test-access',expires_in:3600});
       if(u.hostname==='docs.googleapis.com'){
+        if (request.method === 'GET') {
+          assert.equal(u.pathname, `/v1/documents/${document}`);
+          assert.equal(u.searchParams.get('includeTabsContent'), 'true');
+          assert.equal(u.searchParams.get('suggestionsViewMode'), 'PREVIEW_WITHOUT_SUGGESTIONS');
+          minutesReads.push(request.url);
+          return MockResponse.json({ tabs: [{ tabProperties: { tabId: 't.meeting' }, documentTab: { body: { content: [{ paragraph: { elements: [{ textRun: { content: previousDocumentText ?? '' } }] } }] } } }] });
+        }
         assert.equal(u.pathname,`/v1/documents/${document}:batchUpdate`);
         const body=await request.json() as {requests:Record<string,any>[]};writes.push(body);
         if(body.requests[0].addDocumentTab)return addStatus===200?MockResponse.json({replies:[{addDocumentTab:{tabProperties:{tabId:'t.meeting'}}}]}):MockResponse.json({error:{}},{status:addStatus});
@@ -92,7 +107,7 @@ before(async()=>{
           return invitationStatus===200?MockResponse.json({id:'123456789012345680',mention_everyone:invitationMention}):MockResponse.json({error:{}},{status:invitationStatus});
         }
         notifications.push(body);
-        assert.ok(writes.some(w=>w.requests.some(r=>r.insertText)),'notify only after document writes');
+        assert.ok(writes.some(w=>w.requests.some(r=>r.insertText)),'agenda notice only after document writes');
         return notifyStatus===200 ? MockResponse.json({id:'123456789012345679',mention_everyone:true}) : MockResponse.json({retry_after:2},{status:notifyStatus});
       }
       if(u.pathname===`/api/v10/channels/${root}`)return MockResponse.json({id:root,guild_id:guild,type:0,name:'一般'});
@@ -115,6 +130,7 @@ before(async()=>{
   }));
   const db=await mf.getD1Database('DB');
   for(const f of (await readdir('migrations')).sort())for(const sql of (await readFile(`migrations/${f}`,'utf8')).split(';').map(s=>s.trim()).filter(Boolean))await db.prepare(sql).run();
+  await db.prepare('INSERT INTO guild_meeting_settings(guild_id,voice_channel_id,updated_by,updated_at) VALUES(?,?,?,?)').bind(guild,'567890123456789015',user,Date.now()).run();
   await db.prepare('INSERT INTO credentials(id,encrypted_refresh_token,connected_at) VALUES(?,?,?)').bind(`discord:guild:${guild}`,await encrypt('test-refresh',key,`discord:guild:${guild}`),Date.now()).run();
   await db.prepare('INSERT INTO discord_guild_settings(guild_id,document_id,updated_by,updated_at) VALUES(?,?,?,?)').bind(guild,document,user,Date.now()).run();
 });
@@ -124,6 +140,7 @@ beforeEach(()=>{
   writes=[];replies=[];historyPaths=[];imageStatus=textStatus=addStatus=200;rateOnce=revoked=false;contentIntent=true;
   invitations=[];invitationStatus=200;invitationMention=true;
   notifications=[];summaryInputs=[];notifyStatus=summaryStatus=200;
+  previousDocumentText=undefined;minutesReads=[];
 });
 
 test('strict JST datetime, impossible dates, raw text and UTF-16 chunk boundaries',()=>{
@@ -264,7 +281,7 @@ test('debug executes the rolling week with Luna medium, reviewed images and no n
   messages=[message(root,start-1,'期間外'),message(root,start,'開始境界の構造試験'),message(root,end-1,'終了直前'),message(root,end,'終了境界は除外')];
   messages[1].attachments=[{id:'890123456789012345',filename:'photo.png',content_type:'image/png',size:100,url:'https://cdn.discordapp.com/attachments/a/photo.png'}];
   assert.equal((await(await signed(payload)).json() as any).type,5);
-  assert.match(await waitReply(0),/Luna|gpt-5.6-luna/);
+  assert.match(await waitReply(0),/アジェンダを作成/);
   const result=await finish(payload.id);
   assert.equal(result.status,'complete');assert.equal(result.posts,2);
   assert.equal(result.rangeFrom,start);assert.equal(result.rangeTo,end);
@@ -277,8 +294,9 @@ test('debug executes the rolling week with Luna medium, reviewed images and no n
   assert.equal(writes.filter(w=>w.requests[0].insertInlineImage).length,1);
   const written=writes.flatMap(w=>w.requests.filter(r=>r.insertText).map(r=>r.insertText.text)).join('');
   for(const heading of ['1. 今週の要点','2. 部門・テーマ別の進捗','3. 今日話し合うこと'])assert.ok(written.includes(heading));
-  assert.ok(written.includes('試験サーバー 週次会議アジェンダ'));
-  assert.ok(written.includes('開催日時：要確認'));
+  assert.ok(written.startsWith(result.title));
+  assert.equal(result.title,jst(end).slice(0,10).replaceAll('-','/')+' 定例mtg');
+  assert.doesNotMatch(written,/開催日時|対象期間|https:\/\/discord.com/);
   assert.ok(!written.includes('対象ログ内に記載なし'));
   assert.ok(!written.includes('##'));assert.ok(writes.some(w=>w.requests.some(r=>r.updateParagraphStyle)));
   const n=replies.length;await signed(payload);await waitReply(n);await harness('step',payload.id);
@@ -301,7 +319,7 @@ test('debug empty period, permission denial and arbitrary options never generate
   await signed(payload);await waitReply(0);assert.equal((await finish(payload.id)).status,'failed');assert.equal(writes.length,0);assert.equal(summaryInputs.length,0);
   payload=interaction('debug');
   const r=await signed({...payload,member:{user:{id:user},permissions:'0'}});assert.match((await r.json() as any).data.content,/サーバー/);
-  const n=replies.length;await signed(interaction('debug',[{name:'model',type:3,value:'other'}]));assert.match(await waitReply(n),/引数なし/);
+  const n=replies.length;await signed(interaction('debug',[{name:'model',type:3,value:'other'}]));assert.match(await waitReply(n),/引数を確認/);
 });
 
 test('debug window and Markdown styles preserve UTF-16 offsets after images',()=>{
@@ -331,4 +349,184 @@ test('uncertain invitation is never re-sent and only a private actionable error 
 test('missing everyone permission keeps the invitation and explains the needed permission privately',async()=>{
   invitationMention=false;await signed(interaction('schedule'));
   assert.match(await waitReply(0),/全員にメンション/);assert.equal(invitations.length,1);
+});
+
+async function startNotice(action: string, id: string) {
+  const response = await mf.dispatchFetch(`http://localhost:8787/test/start/${action}`, {method:'POST',body:JSON.stringify({guild,id})});
+  assert.equal(response.status,200,await response.clone().text()); return response.json() as Promise<any>;
+}
+test('after:10 waits for the agenda, then shares voice channel and tab exactly once',async()=>{
+  const payload=interaction('debug',[{name:'after',type:4,value:10}]);
+  const received=Number((BigInt(payload.id)>>22n)+1420070400000n);
+  messages=[message(root,received-1000,'飛行試験を確認する')];
+  await signed(payload);assert.match(await waitReply(0),/開始1時間前/);
+  assert.equal(await startNotice('alarm',payload.id),received+10000);
+  assert.equal((await startNotice('step',payload.id)).status,'scheduled');assert.equal(notifications.length,0);
+  const n=replies.length;await signed(payload);await waitReply(n);
+  await startNotice('due',payload.id);
+  assert.equal((await startNotice('step',payload.id)).status,'scheduled');assert.equal(notifications.length,0);
+  const result=await finish(payload.id);assert.equal(result.status,'complete');assert.equal(notifications.length,0);
+  assert.equal((await startNotice('step',payload.id)).status,'sent');
+  assert.equal(notifications[0].content,`@everyone\n1時間後に定例mtgを開始します\n通話チャンネル：<#567890123456789015>\nアジェンダ：${result.url}`);
+  assert.deepEqual(notifications[0].allowed_mentions,{parse:['everyone']});
+  await startNotice('step',payload.id);assert.equal(notifications.length,1);
+  assert.equal(writes[0].requests[0].addDocumentTab.tabProperties.title,jst(received+3610000).slice(0,10).replaceAll('-','/')+' 定例mtg');
+});
+test('datetime is JST, rejects conflicting or past inputs and supports cancellation',async()=>{
+  for(const options of [
+    [{name:'after',type:4,value:0}], [{name:'after',type:3,value:'10'}],
+    [{name:'datetime',type:3,value:'2026-02-30 12:00'}],
+    [{name:'datetime',type:3,value:'2020-01-01 12:00'}],
+    [{name:'datetime',type:3,value:jst(Date.now()+3600000)},{name:'after',type:4,value:10}],
+  ]) {
+    const payload=interaction('debug',options),n=replies.length;
+    await signed(payload);await waitReply(n);
+    assert.equal(await harness('summary',payload.id),null);
+  }
+  const datetime=jst(Date.now()+7200000),payload=interaction('debug',[{name:'datetime',type:3,value:datetime}]);
+  const n=replies.length;await signed(payload);await waitReply(n);
+  assert.equal(await startNotice('alarm',payload.id),jstTime(datetime)-3600_000);
+  const n2=replies.length;await signed(interaction('cancel',[{name:'id',type:3,value:payload.id}]));await waitReply(n2);
+  assert.equal((await startNotice('summary',payload.id)).status,'cancelled');
+  await startNotice('due',payload.id);await startNotice('step',payload.id);assert.equal(notifications.length,0);
+});
+test('uncertain start notice is not resent; 429 retries only the start notice',async()=>{
+  messages=[message(root,Date.now()-1000,'飛行試験を確認する')];
+  const payload=interaction('debug',[{name:'after',type:4,value:100}]);await signed(payload);await waitReply(0);
+  await finish(payload.id);notifyStatus=503;await startNotice('due',payload.id);
+  assert.equal((await startNotice('step',payload.id)).status,'needs_review');
+  await startNotice('step',payload.id);assert.equal(notifications.length,1);
+  const other=interaction('debug',[{name:'after',type:4,value:100}]),n=replies.length;await signed(other);await waitReply(n);
+  await finish(other.id);notifyStatus=429;await startNotice('due',other.id);assert.equal((await startNotice('step',other.id)).status,'scheduled');
+  notifyStatus=200;assert.equal((await startNotice('step',other.id)).status,'sent');assert.ok(writes.length>0);
+});
+test('reminder rejects a text channel configured as voice and never posts',async()=>{
+  messages=[message(root,Date.now()-1000,'試験の確認')];
+  const payload=interaction('debug',[{name:'after',type:4,value:100}]);await signed(payload);await waitReply(0);
+  assert.equal((await finish(payload.id)).status,'complete');
+  const db=await mf.getD1Database('DB');
+  await db.prepare('UPDATE guild_meeting_settings SET voice_channel_id=? WHERE guild_id=?').bind(root,guild).run();
+  try {
+    await startNotice('due',payload.id);
+    const state=await startNotice('step',payload.id);assert.equal(state.status,'failed');assert.match(state.error,/settings/);
+    assert.equal(notifications.length,0);
+  } finally { await db.prepare('UPDATE guild_meeting_settings SET voice_channel_id=? WHERE guild_id=?').bind('567890123456789015',guild).run(); }
+});
+test('R-1 archive merges revisions inside the requested dates and renders numbered source guild citations',async()=>{
+  const db=await mf.getD1Database('DB'),sourceGuild='1451490986520744020',archive='r1-fixture';
+  const at=Date.parse('2026-06-01T00:00:00Z');
+  const posts=[message(root,at,'旧内容'),message(root,at+1000,'削除された報告'),message(root,at+2000,'保管済み報告')];
+  await db.prepare('INSERT INTO meeting_agenda_archives VALUES(?,?,?,?,?,?)').bind(archive,sourceGuild,'R-1',at,at+3000,Date.now()).run();
+  for(const p of posts) await db.prepare('INSERT INTO meeting_agenda_posts VALUES(?,?,?,?)').bind(archive,p.id,p.timestamp,JSON.stringify({...p,channel_name:'構造',parent_id:null})).run();
+  await db.prepare('INSERT INTO meeting_agenda_sources VALUES(?,?)').bind(guild,archive).run();
+  const current={guild_id:sourceGuild,message_id:posts[0].id,channel_id:root,created_at:posts[0].timestamp,edited_at:'2026-06-02T00:00:00Z',author_id:user,author_display_name:'R-1 member',content:'訂正済みの飛行結果'};
+  for(const [i,p] of posts.slice(0,2).entries()) await db.prepare('INSERT INTO cloud_messages(guild,id,channel,created,revision,observed,data,deleted) VALUES(?,?,?,?,?,?,?,?)').bind(sourceGuild,p.id,root,p.timestamp,current.edited_at,Date.now(),JSON.stringify(i===0?current:{...current,message_id:p.id}),i).run();
+  try {
+    const payload=interaction('debug',[{name:'from',type:3,value:'2026-06-01'},{name:'to',type:3,value:'2026-06-03'}]);await signed(payload);await waitReply(0);
+    const result=await finish(payload.id);assert.equal(result.status,'complete');assert.equal(result.posts,2);
+    assert.equal(result.sourceGuild,sourceGuild);assert.equal(historyPaths.length,0);
+    const input=JSON.stringify(summaryInputs);assert.match(input,/訂正済みの飛行結果/);assert.ok(!input.includes('旧内容'));assert.ok(!input.includes('削除された報告'));assert.match(input,/R-1/);
+    const content=writes.flatMap(w=>w.requests.filter(r=>r.insertText).map(r=>r.insertText.text)).join('');
+    assert.doesNotMatch(content,/https:|過去ログ|開催日時|対象期間/);
+    assert.ok(writes.some(w=>w.requests.some(r=>r.updateTextStyle?.textStyle.baselineOffset==='SUPERSCRIPT'&&r.updateTextStyle.textStyle.link.url.includes(`discord.com/channels/${sourceGuild}/`))));
+    assert.ok(content.startsWith(result.title));
+  } finally { await db.prepare('DELETE FROM meeting_agenda_sources WHERE guild=?').bind(guild).run(); }
+});
+
+test('archive defaults use the rolling week even when stored bounds span months or extend into the future',async()=>{
+  const db=await mf.getD1Database('DB'),archive='r1-default-window';
+  const payload=interaction('debug',[{name:'previous',type:3,value:'none'}]);
+  const end=Number((BigInt(payload.id)>>22n)+1420070400000n),start=end-DEBUG_WEEK;
+  const posts=[message(root,start-1,'古いアーカイブ'),message(root,start,'今週の報告'),message(root,end-1,'直近の報告'),message(root,end,'終了境界'),message(root,end+1000,'未来の投稿')];
+  await db.prepare('INSERT INTO meeting_agenda_archives VALUES(?,?,?,?,?,?)').bind(archive,guild,'R-1',start-100*86400_000,end+86400_000,Date.now()).run();
+  for(const p of posts)await db.prepare('INSERT INTO meeting_agenda_posts VALUES(?,?,?,?)').bind(archive,p.id,p.timestamp,JSON.stringify({...p,channel_name:'構造',parent_id:null})).run();
+  await db.prepare('INSERT INTO meeting_agenda_sources VALUES(?,?)').bind(guild,archive).run();
+  try {
+    await signed(payload);await waitReply(0);
+    const result=await finish(payload.id);assert.equal(result.status,'complete');assert.equal(result.posts,2);
+    assert.equal(result.rangeFrom,start);assert.equal(result.rangeTo,end);
+    const input=JSON.stringify(summaryInputs);assert.match(input,/今週の報告/);assert.match(input,/直近の報告/);
+    assert.doesNotMatch(input,/古いアーカイブ|終了境界|未来の投稿/);
+  }finally{await db.prepare('DELETE FROM meeting_agenda_sources WHERE guild=?').bind(guild).run();}
+});
+
+test('two archive weeks read the edited first Docs tab and preserve the chosen minutes across retries',async()=>{
+  const db=await mf.getD1Database('DB'),archive='r1-two-weeks';
+  const from=jstTime('2026-06-14 00:00'),split=jstTime('2026-06-21 00:00'),to=jstTime('2026-06-28 00:00');
+  const posts=[message(root,from-1,'期間前'),message(root,from,'1週目：固定を検討'),message(root,split,'2週目：印刷を予定'),message(root,to,'期間後')];
+  await db.prepare('INSERT INTO meeting_agenda_archives VALUES(?,?,?,?,?,?)').bind(archive,guild,'R-1',from-1,to+1,Date.now()).run();
+  for(const p of posts)await db.prepare('INSERT INTO meeting_agenda_posts VALUES(?,?,?,?)').bind(archive,p.id,p.timestamp,JSON.stringify({...p,channel_name:'構造',parent_id:null})).run();
+  await db.prepare('INSERT INTO meeting_agenda_sources VALUES(?,?)').bind(guild,archive).run();
+  const opts=(a:string,b:string,previous:string)=>[{name:'from',type:3,value:a},{name:'to',type:3,value:b},{name:'previous',type:3,value:previous}];
+  try{
+    const first=interaction('debug',opts('2026-06-14','2026-06-21','none'));
+    await signed(first);await waitReply(0);
+    const one=await finish(first.id);assert.equal(one.status,'complete');assert.equal(one.posts,1);assert.equal(minutesReads.length,0);
+    assert.equal(one.rangeFrom,from);assert.equal(one.rangeTo,split);
+    const firstPayload=JSON.parse(summaryInputs[0].input[0].content[0].text);
+    assert.equal(firstPayload.from,'2026-06-14');assert.equal(firstPayload.to,'2026-06-21');
+    assert.equal(firstPayload.messages[0].content,'1週目：固定を検討');assert.equal(firstPayload.previousMinutes,null);
+    previousDocumentText=writes.flatMap(w=>w.requests.flatMap(r=>r.insertText?[r.insertText.text]:[])).join('')+'\n会議追記：手持ちのネジで進めると決定。太郎が6月27日までに電流を測る。';
+    const second=interaction('debug',opts('2026-06-21','2026-06-28',first.id));
+    const n=replies.length;await signed(second);await waitReply(n);
+    let two:any;
+    for(let i=0;i<80;i++){two=await harness('step',second.id);if(two.status==='adding')break;}
+    assert.equal(two.status,'adding',JSON.stringify(two));
+    assert.equal(two.posts,1);assert.equal(two.previousMinutesId,first.id);assert.equal(minutesReads.length,1);
+    assert.equal(two.rangeFrom,split);assert.equal(two.rangeTo,to);
+    const secondPayload=JSON.parse(summaryInputs.at(-1).input[0].content[0].text);
+    assert.equal(secondPayload.from,'2026-06-21');assert.equal(secondPayload.to,'2026-06-28');
+    assert.match(secondPayload.previousMinutes.content,/太郎が6月27日までに電流/);
+    assert.equal(secondPayload.messages[0].content,'2週目：印刷を予定');
+    previousDocumentText='後から編集した内容';
+    await mf.unsafeEvictDurableObject('meeting-test','TestMeetingScheduler',{name:`${guild}:${second.id}`});
+    assert.equal((await finish(second.id)).status,'complete');
+    assert.equal(minutesReads.length,1);assert.equal(summaryInputs.length,3);
+    assert.equal(writes.filter(w=>w.requests[0].addDocumentTab).length,2);
+    const allText=writes.flatMap(w=>w.requests.flatMap(r=>r.insertText?[r.insertText.text]:[])).join('');
+    assert.doesNotMatch(allText,/https:|開催日時|対象期間/);assert.equal(notifications.length,0);
+    assert.ok(writes.some(w=>w.requests.some(r=>r.updateTextStyle?.textStyle.baselineOffset==='SUPERSCRIPT'&&r.updateTextStyle.textStyle.link.url.includes('docs.google.com'))));
+    const replay=replies.length;await signed(second);await waitReply(replay);await harness('step',second.id);
+    assert.equal(minutesReads.length,1);assert.equal(summaryInputs.length,3);
+  }finally{await db.prepare('DELETE FROM meeting_agenda_sources WHERE guild=?').bind(guild).run();}
+});
+
+test('debug rejects partial, impossible, inverted and future archive windows before reserving',async()=>{
+  for(const options of [
+    [{name:'from',type:3,value:'2026-06-14'}],
+    [{name:'from',type:3,value:'2026-02-30'},{name:'to',type:3,value:'2026-03-02'}],
+    [{name:'from',type:3,value:'2026-06-21'},{name:'to',type:3,value:'2026-06-14'}],
+    [{name:'from',type:3,value:'2099-06-14'},{name:'to',type:3,value:'2099-06-21'}],
+    [{name:'previous',type:3,value:'arbitrary-url'}],
+  ]){
+    const payload=interaction('debug',options),n=replies.length;await signed(payload);await waitReply(n);
+    assert.equal(await harness('summary',payload.id),null);
+  }
+  assert.equal(summaryInputs.length,0);assert.equal(writes.length,0);
+});
+
+test('automatic carryover chooses a completed normal MTG and excludes newer debug agendas',async()=>{
+  const db=await mf.getD1Database('DB');
+  messages=[message(root,Date.now()-3600000,'電装試験')];
+  const previousId=newId();
+  const normal:MeetingInput={id:previousId,guild,user,document,title:'通常MTG',runAt:Date.now()+3600000,mode:'agenda',...debugWindow(Date.now()-2000)};
+  await harness('book',previousId,{input:normal});await harness('due',previousId,{runAt:Date.now()-2000});
+  assert.equal((await finish(previousId)).status,'complete');
+  await db.prepare('INSERT INTO meeting_reservations(id,guild,user,run_at,title,document,created,meeting_at) VALUES(?,?,?,?,?,?,?,?)').bind(previousId,guild,user,Date.now()-2000,'通常MTG',document,Date.now()-2000,Date.now()-1000).run();
+  try{
+    const debug=interaction('debug',[{name:'previous',type:3,value:'none'}]);let n=replies.length;await signed(debug);await waitReply(n);assert.equal((await finish(debug.id)).status,'complete');
+    previousDocumentText='決定：固定はネジで行う。担当太郎が電流測定。';
+    const current=interaction('debug');n=replies.length;await signed(current);await waitReply(n);
+    const output=await finish(current.id);assert.equal(output.status,'complete');assert.equal(output.previousMinutesId,previousId);assert.equal(minutesReads.length,1);
+  }finally{await db.prepare('DELETE FROM meeting_reservations WHERE id=?').bind(previousId).run();}
+});
+
+test('explicit carryover rejects another guild or document before reading Google or generating',async()=>{
+  const db=await mf.getD1Database('DB');messages=[message(root,Date.now()-3600000,'電装試験')];
+  for(const [otherGuild,otherDocument] of [['999999999999999999',document],[guild,'different_document_123']]){
+    const id=newId();await db.prepare('INSERT INTO meeting_reservations(id,guild,user,run_at,title,document,created) VALUES(?,?,?,?,?,?,?)').bind(id,otherGuild,user,Date.now()-10000,'別の会議',otherDocument,Date.now()-10000).run();
+    const payload=interaction('debug',[{name:'previous',type:3,value:id}]),n=replies.length;await signed(payload);await waitReply(n);
+    const result=await finish(payload.id);assert.equal(result.status,'failed');assert.match(result.error,/同じサーバー・保存先/);
+  }
+  assert.equal(minutesReads.length,0);assert.equal(summaryInputs.length,0);assert.equal(writes.length,0);
 });

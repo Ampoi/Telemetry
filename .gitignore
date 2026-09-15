@@ -29,3 +29,6 @@ exports/
 *.part
 
 .test-dist/
+
+# Rebuilt from shadcn components by ui:build
+src/generated/

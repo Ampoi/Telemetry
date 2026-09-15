@@ -1,4 +1,5 @@
 import { AppError } from './errors';
+import { citationNumber, citationPattern } from './agenda/citations';
 
 export function documentId(input: string): string {
   const value = input.trim();
@@ -31,22 +32,30 @@ export function renderTemplate(template: string, data: Record<string, unknown>):
 }
 
 export interface Paragraph { start: number; end: number; style?: string; bullet?: boolean }
-export function compileMarkdown(markdown: string): { text: string; paragraphs: Paragraph[] } {
+interface Citation { start: number; end: number; url: string }
+export function compileMarkdown(markdown: string): { text: string; paragraphs: Paragraph[]; citations: Citation[] } {
   let text = '';
   const paragraphs: Paragraph[] = [];
+  const citations: Citation[] = [];
   for (const line of markdown.replace(/\n$/, '').split('\n')) {
     const heading = line.match(/^(#{1,6})\s+(.+)$/);
     const bullet = line.match(/^[-*]\s+(.+)$/);
-    const content = heading?.[2] ?? bullet?.[1] ?? line;
     const start = text.length + 1;
+    let removed = 0;
+    const content = (heading?.[2] ?? bullet?.[1] ?? line).replace(citationPattern(), (match, label: string, url: string, offset: number) => {
+      const number = citationNumber(label), at = start + offset - removed;
+      citations.push({ start: at, end: at + number.length, url });
+      removed += match.length - number.length;
+      return number;
+    });
     text += `${content}\n`;
     paragraphs.push({ start, end: text.length + 1, ...(heading ? { style: `HEADING_${heading[1].length}` } : {}), ...(bullet ? { bullet: true } : {}) });
   }
-  return { text, paragraphs };
+  return { text, paragraphs, citations };
 }
 
 export function contentRequests(markdown: string, tabId: string): Record<string, unknown>[] {
-  const { text, paragraphs } = compileMarkdown(markdown);
+  const { text, paragraphs, citations } = compileMarkdown(markdown);
   return [
     { insertText: { endOfSegmentLocation: { tabId }, text } },
     ...paragraphs.filter(p => p.style || p.bullet).map(p => {
@@ -55,5 +64,10 @@ export function contentRequests(markdown: string, tabId: string): Record<string,
         ? { updateParagraphStyle: { range, paragraphStyle: { namedStyleType: p.style }, fields: 'namedStyleType' } }
         : { createParagraphBullets: { range, bulletPreset: 'BULLET_DISC_CIRCLE_SQUARE' } };
     }),
+    ...citations.map(c => ({ updateTextStyle: {
+      range: { tabId, startIndex: c.start, endIndex: c.end },
+      textStyle: { baselineOffset: 'SUPERSCRIPT', link: { url: c.url }, underline: false },
+      fields: 'baselineOffset,link,underline',
+    } })),
   ];
 }

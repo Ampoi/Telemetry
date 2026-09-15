@@ -1,10 +1,13 @@
 import { meetingSettings } from './guild-settings';
 import { AppError } from './errors';
 import { guildOwner, requireGuildManager } from './discord-guild';
-import { jst } from './meeting-model';
+import { jst, jstTime } from './meeting-model';
+import { meetingTitle } from './meeting-poll-model';
+import { meetingSource, sourceInput } from './meeting-source';
 import { appOrigin } from './auth';
 import type { Interaction } from './discord';
-import { DEBUG_MODEL, DEBUG_EFFORT, debugWindow } from './debug-agenda';
+import { debugWindow } from './debug-agenda';
+import { acceptMeetingDone, doneStub } from './meeting-done';
 
 const labels: Record<string, string> = { scheduled: '予約済み', collecting: '収集中', preparing: '本文準備中', adding: 'タブ作成中', writing: 'Docs書き込み中', summarizing: 'Docs完成・議題要約中', notifying: 'Docs完成・通知中', notification_failed: 'Docs完成・要約または通知失敗', notification_review: 'Docs完成・通知結果の確認が必要', complete: '完了', cancelled: '取消済み', failed: '失敗', needs_review: 'Docsの確認が必要' };
 const stub = (env: Env, guild: string, id: string) => env.MEETINGS.getByName(`${guild}:${id}`);
@@ -13,7 +16,7 @@ export async function meetingInteraction(interaction: Interaction, env: Env, ctx
   const guild = requireGuildManager(interaction);
   if (env.COLLECTION_MODE !== 'cloud') throw new AppError(400, '/mtgにはクラウド収集モードが必要です。');
   const command = interaction.data?.options?.[0];
-  if (command?.type !== 1 || !['schedule', 'debug', 'status', 'cancel'].includes(command.name)) throw new AppError(400, '/mtg schedule・debug・status・cancelを指定してください。');
+  if (command?.type !== 1 || !['schedule', 'done', 'debug', 'status', 'cancel'].includes(command.name)) throw new AppError(400, '/mtg schedule・done・debug・status・cancelを指定してください。');
   const option = (name: string) => {
     const v = command.options?.find(o => o.name === name);
     if (!v) return '';
@@ -29,20 +32,46 @@ export async function meetingInteraction(interaction: Interaction, env: Env, ctx
     let components: unknown[] = [];
     let announced = false;
     try {
-      if (command.name === 'debug') {
-        if (command.options?.length) throw new AppError(400, '/mtg debug は引数なしで実行してください。直近168時間・Luna・mediumを使用します。');
+      if (command.name === 'done') {
+        if (command.options?.some(o => o.name !== 'id')) throw new AppError(400, '/mtg done または /mtg done id:予約ID を指定してください。');
+        const result = await acceptMeetingDone(interaction, env, guild, id);
+        // The durable job owns this deferred response until publication/error.
+        if (result.accepted) return;
+        announced = result.status === 'complete';
+        content = result.error ?? '議事録をまとめています。完了するとチャンネルに投稿します。';
+      } else if (command.name === 'debug') {
+        if (command.options?.some(o => !['datetime', 'after', 'from', 'to', 'previous'].includes(o.name))) throw new AppError(400, '/mtg debug の引数を確認してください。');
+        const from = option('from'), to = option('to'), previousMeetingId = option('previous');
+        if (!!from !== !!to) throw new AppError(400, 'from と to を両方指定してください（終了日は含みません）。');
+        if (previousMeetingId && previousMeetingId !== 'none' && !/^\d{17,20}$/.test(previousMeetingId)) throw new AppError(400, 'previous は前回の予約ID、初回は none を指定してください。');
+        const range = from ? { rangeFrom: jstTime(`${from} 00:00`), rangeTo: jstTime(`${to} 00:00`) } : undefined;
+        if (range && (range.rangeFrom >= range.rangeTo || range.rangeTo > Date.now() || range.rangeTo - range.rangeFrom > 31 * 86400_000)) throw new AppError(400, '対象期間は過去31日分以内で指定してください。終了日は含みません。');
+        const datetime = option('datetime');
+        const delay = command.options?.find(o => o.name === 'after');
+        if (datetime && delay) throw new AppError(400, 'datetime と after はどちらか一方を指定してください。');
+        if (delay && (delay.type !== 4 || typeof delay.value !== 'number' || !Number.isInteger(delay.value) || delay.value < 1 || delay.value > 86400)) throw new AppError(400, 'after は1〜86400秒で指定してください。');
         if (!(env as Env & { OPENAI_API_KEY?: string }).OPENAI_API_KEY) throw new AppError(400, 'OPENAI_API_KEYをWorkerのSecretへ設定してください。');
         const runAt = Number((BigInt(interaction.id) >> 22n) + 1420070400000n);
         if (runAt > Date.now() || runAt < Date.now() - 14 * 60_000) throw new AppError(400, 'コマンドの受付期限が切れました。');
+        const meetingAt = datetime ? jstTime(datetime) : delay ? runAt + 3600_000 + (delay.value as number) * 1000 : undefined;
+        const existing = await stub(env, guild, interaction.id).summary();
+        if (meetingAt && !existing && (meetingAt <= Date.now() || meetingAt > Date.now() + 366 * 86400_000)) throw new AppError(400, '開始日時は現在より後、366日以内で指定してください。');
+        if (meetingAt && !existing && !(await meetingSettings(env, guild)).voice_channel_id) throw new AppError(400, '/settings でMTGの通話チャンネルを選択してください。');
+        if (meetingAt && !interaction.channel_id) throw new AppError(400, '通知先のチャンネル内で実行してください。');
         const previous = await env.DB.prepare('SELECT document,title FROM meeting_reservations WHERE id=? AND guild=?').bind(interaction.id, guild).first<{ document: string; title: string }>();
         const setting = await env.DB.prepare('SELECT document_id FROM discord_guild_settings WHERE guild_id=?').bind(guild).first<{ document_id: string }>();
         const document = previous?.document ?? setting?.document_id;
         if (!document) throw new AppError(400, '先に /document document:URL で保存先を設定してください。');
         if (!await env.DB.prepare('SELECT id FROM credentials WHERE id=?').bind(guildOwner(guild)).first()) throw new AppError(400, '先に /auth でこのサーバーをGoogleに接続してください。');
-        const title = previous?.title ?? `週次アジェンダ ${jst(runAt)}`;
+        const title = previous?.title ?? meetingTitle(meetingAt ?? runAt);
+        const source = await meetingSource(env, guild);
         await env.DB.prepare('INSERT OR IGNORE INTO meeting_reservations(id,guild,user,run_at,title,document,created) VALUES(?,?,?,?,?,?,?)').bind(interaction.id, guild, interaction.member!.user!.id, runAt, title, document, runAt).run();
-        const result = await stub(env, guild, interaction.id).book({ id: interaction.id, guild, user: interaction.member!.user!.id, runAt, title, document, mode: 'debug-agenda', ...debugWindow(runAt) });
-        content = `週次アジェンダ ${labels[result!.status] ?? result!.status}\n期間: ${jst(runAt - 7 * 86400_000)} ～ ${jst(runAt)} JST（直近168時間）\nモデル: ${DEBUG_MODEL} / 推論: ${DEBUG_EFFORT}\n全履歴の収集設定を変更せず、取得できる投稿・画像を3部構成にまとめ、新しいDocsタブへ出力します。全員通知は行いません。\n進捗・結果: /mtg status id:${interaction.id}`;
+        await stub(env, guild, interaction.id).book({ id: interaction.id, guild, user: interaction.member!.user!.id, runAt, title, document,
+          mode: meetingAt ? 'agenda' : 'debug-agenda', ...debugWindow(runAt), ...sourceInput(source), ...range,
+          debug: true, previousMeetingId: previousMeetingId || undefined, customRange: !!range,
+          ...(meetingAt ? { meetingAt, channel: interaction.channel_id, startNotice: true } : {}) });
+        content = meetingAt ? `${jst(meetingAt)}（日本時間）の会議を予約しました。開始1時間前に通話チャンネルとアジェンダを通知します。アジェンダ作成が間に合わない場合は完成後に通知します。\nアジェンダ：${title}\n確認・取消：/mtg status id:${interaction.id}`
+          : `アジェンダを作成します。\n${title}\n確認：/mtg status id:${interaction.id}`;
       } else if (command.name === 'schedule') {
         if (command.options?.length) throw new AppError(400, '/mtg schedule は引数なしで実行してください。');
         if (!interaction.channel_id || !/^\d{17,20}$/.test(interaction.channel_id)) throw new AppError(400, '通知先のチャンネル内で実行してください。');
@@ -50,6 +79,7 @@ export async function meetingInteraction(interaction: Interaction, env: Env, ctx
         if (!setting) throw new AppError(400, '先に /document document:URL で保存先を設定してください。');
         if (!await env.DB.prepare('SELECT id FROM credentials WHERE id=?').bind(guildOwner(guild)).first()) throw new AppError(400, '先に /auth でこのサーバーをGoogleに接続してください。');
         const preferences = await meetingSettings(env, guild);
+        if (!preferences.voice_channel_id) throw new AppError(400, '/settings でMTGの通話チャンネルを選択してください。');
         await env.DB.prepare('INSERT OR IGNORE INTO meeting_polls(id,guild,user,created) VALUES(?,?,?,?)').bind(interaction.id, guild, interaction.member!.user!.id, Date.now()).run();
         const row = await env.DB.prepare('SELECT created FROM meeting_polls WHERE id=?').bind(interaction.id).first<{ created: number }>();
         await env.MEETING_POLLS.getByName(interaction.id).create({ id: interaction.id, guild, user: interaction.member!.user!.id, channel: preferences.channel_id ?? interaction.channel_id, centerDays: preferences.center_days, radiusDays: preferences.radius_days, document: setting.document_id, created: row!.created });
@@ -77,7 +107,15 @@ export async function meetingInteraction(interaction: Interaction, env: Env, ctx
             let result;
             if (command.name === 'cancel') result = await stub(env, guild, row.id).cancel();
             else result = await stub(env, guild, row.id).summary();
-            reports.push(result ? `${result.id} | ${result.mode ? 'アジェンダ' : 'MTG'} ${jst(result.meetingAt ?? result.runAt)} JST | ${result.status === 'generating' ? 'アジェンダ生成中' : labels[result.status]}\n${result.title}${result.url ? `\n${result.url}` : ''}${result.error ? `\n${result.error}` : ''}` : `${row.id}: 予約を確定できませんでした。新しくコマンドを実行してください。`);
+            const notice = result?.startNotice ? await env.MEETING_STARTS.getByName(`${guild}:${row.id}`).summary() : undefined;
+            const noticeLabels = { scheduled: '予約済み', sending: '送信中', sent: '送信済み', failed: '失敗', needs_review: 'チャンネルを確認してください', cancelled: '取消済み' };
+            reports.push(result ? `${result.id} | ${result.mode ? 'アジェンダ' : 'MTG'} ${jst(result.meetingAt ?? result.runAt)} JST | ${result.status === 'generating' ? 'アジェンダ生成中' : labels[result.status]}\n${result.title}${notice ? `\n開始通知：${noticeLabels[notice.status]}` : ''}${result.url ? `\n${result.url}` : ''}${result.error ? `\n${result.error}` : ''}${notice?.error ? `\n${notice.error}` : ''}` : `${row.id}: 予約を確定できませんでした。新しくコマンドを実行してください。`);
+          }
+          if (command.name === 'status' && env.MEETING_DONE) {
+            for (const [n, row] of rows.entries()) {
+              const done = await doneStub(env, guild, row.id).summary();
+              if (done) reports[n] += `\n終了後のまとめ：${done.status === 'complete' ? '投稿済み' : done.error ?? '作成中'}${done.status === 'complete' ? `\n${done.pollUrl}` : ''}`;
+            }
           }
           content = reports.join('\n\n');
         }

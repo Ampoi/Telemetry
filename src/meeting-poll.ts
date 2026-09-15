@@ -1,6 +1,8 @@
 import { appOrigin } from './auth';
 import { DurableObject } from 'cloudflare:workers';
 import { discord, DiscordError } from './cloud/discord-rest';
+import { meetingSource, sourceInput } from './meeting-source';
+import { debugWindow } from './debug-agenda';
 import { jst, type MeetingInput } from './meeting-model';
 import { pollDays, meetingTitle, commonSlot, windowStart, DAY, SLOT, type PollInput, type PollState } from './meeting-poll-model';
 
@@ -129,7 +131,10 @@ export class MeetingPoll extends DurableObject<Env> {
     if (p.status !== 'booking') return;
     await this.ctx.storage.setAlarm(Date.now() + 60_000);
     try {
-      const input: MeetingInput = { id: p.id, guild: p.guild, user: p.user, channel: p.channel, document: p.document, title: p.title, meetingAt: p.meetingAt!, runAt: p.meetingAt! - 3600_000 };
+      const runAt = p.meetingAt! - 7200_000;
+      const source = await meetingSource(this.env, p.guild);
+      const input: MeetingInput = { id: p.id, guild: p.guild, user: p.user, channel: p.channel, document: p.document, title: p.title,
+        meetingAt: p.meetingAt!, runAt, mode: 'agenda', startNotice: true, ...debugWindow(runAt), ...sourceInput(source) };
       await this.env.DB.prepare('INSERT OR IGNORE INTO meeting_reservations(id,guild,user,run_at,title,document,created,meeting_at,channel) VALUES(?,?,?,?,?,?,?,?,?)')
         .bind(p.id, p.guild, p.user, input.runAt, p.title, p.document, p.created, input.meetingAt, p.channel).run();
       const result = await this.env.MEETINGS.getByName(`${p.guild}:${p.id}`).book(input);

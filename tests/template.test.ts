@@ -39,3 +39,13 @@ test('トークンを暗号化でき、別の鍵・改変された暗号文を�
   pieces[2] = `${pieces[2][0] === 'A' ? 'B' : 'A'}${pieces[2].slice(1)}`;
   await assert.rejects(decrypt(pieces.join('.'), secret));
 });
+
+test('numbered citations work through the Docs API adapter without exposing URLs or interpreting other Markdown', () => {
+  const markdown = '# 確認😀\n- 結果[¹²](https://discord.com/channels/1/2/3)／次[²](https://discord.com/channels/1/2/4)\n[普通](https://example.com)';
+  const compiled = compileMarkdown(markdown);
+  assert.equal(compiled.text, '確認😀\n結果12／次2\n[普通](https://example.com)\n');
+  assert.deepEqual(compiled.citations.map(c => compiled.text.slice(c.start - 1, c.end - 1)), ['12', '2']);
+  const styles = contentRequests(markdown, 't.cite').flatMap((r: any) => r.updateTextStyle ? [r.updateTextStyle] : []);
+  assert.equal(styles.length, 2);
+  assert.ok(styles.every(s => s.textStyle.baselineOffset === 'SUPERSCRIPT' && s.range.tabId === 't.cite'));
+});

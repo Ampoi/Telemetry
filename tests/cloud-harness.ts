@@ -6,10 +6,13 @@ import { consume, dispatch } from '../src/cloud/jobs';
 import { cleanup } from '../src/cloud/media';
 import type { Task, RemoteMessage } from '../src/cloud/model';
 export { MeetingPoll } from '../src/meeting-poll';
+export { MeetingDone } from '../src/meeting-done';
 export { MeetingScheduler } from '../src/meeting-scheduler';
+export { MeetingStart } from '../src/meeting-start';
 export { CollectionRecovery } from '../src/cloud/recovery';
 import { MeetingPoll } from '../src/meeting-poll';
 import { MeetingScheduler } from '../src/meeting-scheduler';
+import { MeetingStart } from '../src/meeting-start';
 import { CollectionRecovery } from '../src/cloud/recovery';
 import type { MeetingInput, MeetingState } from '../src/meeting-model';
 
@@ -20,6 +23,15 @@ export class TestMeetingScheduler extends MeetingScheduler {
     const state: MeetingState = JSON.parse(row.data); state.runAt = runAt;
     this.ctx.storage.sql.exec('UPDATE meeting SET data=? WHERE id=1', JSON.stringify(state));
     await this.ctx.storage.deleteAlarm();
+  }
+  async step() { await super.alarm(); await this.ctx.storage.deleteAlarm(); return this.summary(); }
+  async alarmTime() { return this.ctx.storage.getAlarm(); }
+}
+export class TestMeetingStart extends MeetingStart {
+  async due() {
+    const notice = await this.ctx.storage.get<any>('notice');
+    notice.meetingAt = Date.now() + 3600_000 - 100;
+    await this.ctx.storage.put('notice', notice); await this.ctx.storage.deleteAlarm();
   }
   async step() { await super.alarm(); await this.ctx.storage.deleteAlarm(); return this.summary(); }
   async alarmTime() { return this.ctx.storage.getAlarm(); }
@@ -35,6 +47,14 @@ export default {
     if(path==='/test/config') { try { return await cloudApi(new Request(request.url.replace('/test/config','/api/telemetry/config'), request),env); } catch(error) { return Response.json({error:String(error),stack:error instanceof Error?error.stack:null},{status:500}); } }
     if(!path.startsWith('/test/'))return worker.fetch(request,env,ctx);
     try{
+      if(path.startsWith('/test/start/')) {
+        const data=await request.json() as {guild:string;id:string};
+        const stub=(env.MEETING_STARTS as unknown as DurableObjectNamespace<TestMeetingStart>).getByName(`${data.guild}:${data.id}`);
+        if(path.endsWith('/due')) { await stub.due(); return Response.json({ok:true}); }
+        if(path.endsWith('/step'))return Response.json(await stub.step());
+        if(path.endsWith('/alarm'))return Response.json(await stub.alarmTime());
+        return Response.json(await stub.summary());
+      }
       if(path==='/test/poll') {
         const data=await request.json() as {input:import('../src/meeting-poll-model').PollInput};
         await env.MEETING_POLLS.getByName(data.input.id).create(data.input);

@@ -11,20 +11,22 @@
   "scripts": {
     "preinstall": "node scripts/require-pnpm.mjs",
     "setup": "tsx scripts/setup.ts",
-    "dev": "wrangler dev --ip localhost --port 8787",
+    "dev": "pnpm run ui:build && wrangler dev --ip localhost --port 8787",
     "demo": "tsx scripts/cli.ts",
+    "mtg:replay": "tsx scripts/replay-agenda.ts",
     "discord:register": "tsx scripts/register-discord.ts",
     "discord:profile": "tsx scripts/discord-profile.ts",
     "db:local": "wrangler d1 migrations apply telemetry --local",
     "db:remote": "wrangler d1 migrations apply telemetry --remote",
     "types": "wrangler types",
-    "typecheck": "tsc --noEmit",
-    "build": "wrangler deploy --dry-run --outdir dist",
-    "test": "pnpm run build && pnpm exec wrangler deploy tests/cloud-harness.ts --dry-run --outdir .test-dist && tsx --test tests/*.test.ts",
+    "typecheck": "pnpm run ui:build && tsc --noEmit",
+    "build": "pnpm run ui:build && wrangler deploy --dry-run --outdir dist",
+    "test": "pnpm run build && pnpm exec wrangler deploy tests/cloud-harness.ts --dry-run --outdir .test-dist && pnpm exec wrangler deploy tests/meeting-done-harness.ts --dry-run --outdir .test-dist/done && tsx --test tests/*.test.ts",
     "check": "pnpm types && pnpm typecheck && pnpm test && pnpm --filter @telemetry/collector check",
-    "deploy": "wrangler deploy",
+    "deploy": "pnpm run ui:build && wrangler deploy",
     "collector": "pnpm --filter @telemetry/collector start",
-    "telemetry": "tsx scripts/telemetry.ts"
+    "telemetry": "tsx scripts/telemetry.ts",
+    "ui:build": "pnpm exec tailwindcss -i src/ui/meeting.css -o dist/meeting.css --minify && tsx scripts/build-meeting-ui.ts"
   },
   "devDependencies": {
     "@tailwindcss/cli": "^4.3.3",

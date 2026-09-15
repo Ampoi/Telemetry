@@ -13,7 +13,9 @@ import { cloudApi } from './cloud/api';
 import { consume } from './cloud/jobs';
 import type { QueueJob } from './cloud/model';
 export { MeetingPoll } from './meeting-poll';
+export { MeetingDone } from './meeting-done';
 export { MeetingScheduler } from './meeting-scheduler';
+export { MeetingStart } from './meeting-start';
 export { CollectionRecovery } from './cloud/recovery';
 
 interface Tab { tabProperties: { tabId: string; title: string }; childTabs?: Tab[] }

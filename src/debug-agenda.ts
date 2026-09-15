@@ -1,10 +1,12 @@
-import { generateAgenda, type Message } from './agenda/index';
+import { generateAgenda, renderMarkdown, type Message } from './agenda/index';
 import { agendaLayout } from './agenda/layout';
+import { citationFormatter, citationPattern } from './agenda/citations';
 import { AppError } from './errors';
 import { mediaUrl } from './cloud/media';
 import { docsText, jst, type ImagePart, type MeetingPost, type MeetingState } from './meeting-model';
 import { compileMarkdown, contentRequests } from './template';
 import { textRequests } from './meeting-model';
+import type { PreviousMinutes } from './meeting-previous';
 
 export const DEBUG_MODEL = 'gpt-5.6-luna';
 export const DEBUG_EFFORT = 'medium';
@@ -19,7 +21,7 @@ export function agendaMessages(posts: MeetingPost[], guild: string): Message[] {
     created_at: p.timestamp, edited_at: p.edited_timestamp, content: p.content,
     author_display_name: p.member?.nick ?? p.author.global_name ?? p.author.username,
     department: p.channel_name, reply_to_message_id: p.message_reference?.message_id,
-    attachments: p.attachments.map(a => ({ attachment_id: a.id, filename: a.filename, content_type: a.content_type })),
+    attachments: p.attachments.map(a => ({ attachment_id: a.id, filename: a.filename.length > 300 ? a.filename.slice(0, 299) + '…' : a.filename, content_type: a.content_type })),
   }));
 }
 
@@ -45,15 +47,17 @@ async function imageData(url: string): Promise<string> {
   return `data:${type};base64,${btoa(binary)}`;
 }
 
-export async function createDebugAgenda(posts: MeetingPost[], state: MeetingState, apiKey: string): Promise<DebugResult> {
-  if (!posts.length) throw new AppError(400, '直近1週間に取得可能な投稿がありません。アジェンダは作成しませんでした。');
-  const notes = [`対象期間: ${jst(state.rangeFrom!)} ～ ${jst(state.rangeTo!)} JST（終了時刻を含まない直近168時間）`];
+export async function createDebugAgenda(posts: MeetingPost[], state: MeetingState, apiKey: string, previous?: PreviousMinutes): Promise<DebugResult> {
+  if (!posts.length && !previous) throw new AppError(400, '対象期間に取得可能な投稿がありません。アジェンダは作成しませんでした。');
+  const notes = [`対象期間: ${jst(state.rangeFrom!)} ～ ${jst(state.rangeTo!)} JST（終了時刻を含まない）${state.sourceArchive ? '。過去ログを今回の会議の参考資料として使用。過去の報告を今週の実績と解釈しないでください。' : ''}`];
   if (state.skipped) notes.push(`閲覧できずスキップした取得処理: ${state.skipped}件。収集時点で削除済みの投稿は含みません。`);
   const images: { attachmentId: string; dataUrl: string }[] = [];
   const candidates = posts.flatMap(p => p.attachments).filter(a => a.content_type?.startsWith('image/'));
-  let bytes = 0;
+  let bytes = 0, attempted = 0;
   for (const a of candidates) {
-    if (images.length >= 20 || a.size > 3_000_000 || !['image/png','image/jpeg','image/webp'].includes(a.content_type ?? '')) continue;
+    if (attempted >= 20) break;
+    if (a.size > 3_000_000 || !['image/png','image/jpeg','image/webp'].includes(a.content_type ?? '')) continue;
+    attempted++;
     try {
       const dataUrl = await imageData(a.url);
       if (bytes + dataUrl.length > 16_000_000) continue;
@@ -63,11 +67,13 @@ export async function createDebugAgenda(posts: MeetingPost[], state: MeetingStat
   if (images.length < candidates.length) notes.push(`画像${candidates.length}件中${images.length}件をAIへ送信。取得不可・形式・サイズ・枚数上限による未確認画像は元投稿リンクで表示します。`);
   // generateAgenda accepts JST dates. The collector already applies the exact
   // rolling window; these enclosing dates cannot admit additional posts.
-  const result = await generateAgenda({ project: state.projectName ?? 'プロジェクト名要確認', meetingAt: state.meetingAt ? `${jst(state.meetingAt)} JST` : '要確認',
-    guildId: state.guild, from: jst(state.rangeFrom!).slice(0, 10), to: jst(state.rangeTo! + 86400_000).slice(0, 10),
-    messages: agendaMessages(posts, state.guild), images, coverageNotes: notes,
-  }, { apiKey, model: DEBUG_MODEL, reasoningEffort: DEBUG_EFFORT, maxRequests: 12 });
-  return { ...result, metadata: { ...result.metadata, from: new Date(state.rangeFrom!).toISOString(), to: new Date(state.rangeTo!).toISOString() } };
+  const sourceGuild = state.sourceGuild ?? state.guild;
+  const result = await generateAgenda({ project: state.projectName ?? 'プロジェクト名要確認', meetingAt: `${jst(state.meetingAt ?? state.runAt)} JST`,
+    guildId: sourceGuild, from: jst(state.rangeFrom!).slice(0, 10), to: jst(state.rangeTo! - 1 + 86400_000).slice(0, 10),
+    messages: agendaMessages(posts, sourceGuild), images, coverageNotes: notes, previousMinutes: previous?.text, previousMinutesUrl: previous?.url,
+  }, { apiKey, model: DEBUG_MODEL, reasoningEffort: DEBUG_EFFORT, maxRequests: state.sourceArchive ? 30 : 12, chunkCharacters: state.sourceArchive ? 100000 : 30000 });
+  result.title = state.title;
+  return { ...result, markdown: renderMarkdown(result), metadata: { ...result.metadata, from: new Date(state.rangeFrom!).toISOString(), to: new Date(state.rangeTo!).toISOString() } };
 }
 
 // Render structured points so images sit next to the statements that cite them.
@@ -78,18 +84,17 @@ export function agendaParts(result: DebugResult, posts: MeetingPost[]): AgendaPa
   const add = (s: string) => parts.push({ kind: 'markdown', value: s + '\n' });
   const media = new Map(posts.flatMap(p => p.attachments.map(a => [a.id, { channel: p.channel_id, message: p.id, attachment: a.id }] as const)));
   const seen = new Set<string>();
+  const citations = citationFormatter(result.sources);
   add(`# ${clean(result.title)}`);
-  add(`開催日時：${clean(result.meetingAt)}`);
   for (const block of agendaLayout(result.agenda)) {
     if ('heading' in block) { add(`${'#'.repeat(block.level)} ${clean(block.heading)}`); continue; }
-    add(`${block.bullet ? '- ' : ''}${block.entries.map(({ label, point }) => `${label ? label + '：' : ''}${clean(point.text)}`).join('／')}`);
-    for (const id of new Set(block.entries.flatMap(e => e.point.sourceIds))) add(result.sources[id].url);
+    add(`${block.bullet ? '- ' : ''}${block.entries.map(({ label, point }) => `${label ? label + '：' : ''}${clean(point.text)} ${citations.sourceIds(point.sourceIds)}`).join('／')}`);
     for (const { point: p } of block.entries) {
       for (const id of p.mediaIds) {
         const a = result.media[id], ref = media.get(id);
         if (!a || !ref || seen.has(id)) continue;
         seen.add(id);
-        add(`添付：${clean(a.filename || id)}${a.imageReviewed ? '' : '（内容未確認）'}\n${a.sourceUrl}`);
+        add(`添付：${clean(a.filename || id)}${a.imageReviewed ? '' : '（内容未確認）'} ${citations.url(a.sourceUrl)}`);
         if (a.imageReviewed && ['image/png','image/jpeg'].includes(a.content_type ?? '')) {
           parts.push({ kind: 'image', value: JSON.stringify(ref satisfies ImagePart) }); add('');
         }
@@ -97,6 +102,25 @@ export function agendaParts(result: DebugResult, posts: MeetingPost[]): AgendaPa
     }
   }
   return parts;
+}
+
+/** Keep citation markup intact when a long paragraph spans multiple Docs writes. */
+export function splitAgendaText(value: string, limit = 12_000): string[] {
+  const refs = [...value.matchAll(citationPattern())];
+  const chunks: string[] = [];
+  for (let start = 0; start < value.length;) {
+    let end = Math.min(start + limit, value.length);
+    if (end < value.length) {
+      const newline = value.lastIndexOf('\n', end - 1);
+      if (newline > start) end = newline + 1;
+      const ref = refs.find(r => r.index! < end && r.index! + r[0].length > end);
+      if (ref) end = ref.index!;
+      if (end <= start) throw new Error('CitationTooLong');
+      if (/[\ud800-\udbff]/.test(value[end - 1])) end--;
+    }
+    chunks.push(value.slice(start, end)); start = end;
+  }
+  return chunks;
 }
 
 export function agendaTextRequests(markdown: string, tabId: string, index: number): { text: string; requests: Record<string, unknown>[] } {

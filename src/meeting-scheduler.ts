@@ -5,8 +5,11 @@ import { accessToken, googleDocs } from './google';
 import { discord, DiscordError } from './cloud/discord-rest';
 import { iso, snowflake, type RemoteChannel, type RemoteMessage } from './cloud/model';
 import { mediaUrl } from './cloud/media';
+import { storedPost } from './meeting-source';
+import { previousMeetingMinutes, type PreviousMinutes } from './meeting-previous';
+import { exportRecord } from './cloud/store';
 import { notificationText, summarizeMeeting, type SummaryEnv } from './meeting-summary';
-import { agendaParts, agendaTextRequests, createDebugAgenda, DEBUG_MODEL, DEBUG_EFFORT, DEBUG_WEEK, type DebugResult } from './debug-agenda';
+import { agendaParts, agendaTextRequests, createDebugAgenda, splitAgendaText, DEBUG_MODEL, DEBUG_EFFORT, DEBUG_WEEK, type DebugResult } from './debug-agenda';
 import { docsText, embeddable, jst, postText, splitText, textRequests, type ImagePart, type MeetingInput, type MeetingPost, type MeetingState } from './meeting-model';
 
 type Task = { id: string; kind: string; channel: string; cursor: string | null };
@@ -27,6 +30,7 @@ export class MeetingScheduler extends DurableObject<Env> {
         CREATE INDEX IF NOT EXISTS posts_order ON posts(created,id);
         CREATE TABLE IF NOT EXISTS parts (n INTEGER PRIMARY KEY, kind TEXT NOT NULL, value TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending');
         CREATE TABLE IF NOT EXISTS agenda_result (id INTEGER PRIMARY KEY, data TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS agenda_previous (id INTEGER PRIMARY KEY, data TEXT NOT NULL);
       `);
     });
   }
@@ -40,21 +44,25 @@ export class MeetingScheduler extends DurableObject<Env> {
   async book(input: MeetingInput): Promise<ReturnType<MeetingScheduler['summary']>> {
     const previous = this.state();
     if (previous) {
-      for (const key of ['id', 'guild', 'user', 'runAt', 'title', 'document', 'meetingAt', 'channel', 'mode', 'rangeFrom', 'rangeTo'] as const) {
+      for (const key of ['id', 'guild', 'user', 'runAt', 'title', 'document', 'meetingAt', 'channel', 'mode', 'rangeFrom', 'rangeTo', 'sourceArchive', 'sourceGuild', 'startNotice', 'debug', 'previousMeetingId', 'customRange'] as const) {
         if (previous[key] !== input[key]) throw new Error('ReservationConflict');
       }
       // Retrying a lost acknowledgment never recreates a completed/cancelled job.
+      if (previous.startNotice) await this.env.MEETING_STARTS.getByName(`${previous.guild}:${previous.id}`).book(previous);
       if (previous.status === 'scheduled') await this.ctx.storage.setAlarm(previous.runAt);
       return this.summary();
     }
     const deadline = input.meetingAt ?? input.runAt;
-    if (input.mode === 'debug-agenda') {
+    if (input.mode === 'debug-agenda' && !input.sourceArchive && !input.customRange) {
       if (!Number.isSafeInteger(input.rangeFrom) || !Number.isSafeInteger(input.rangeTo) || input.rangeTo! - input.rangeFrom! !== DEBUG_WEEK
           || input.rangeTo! > Date.now() || input.rangeTo! < Date.now() - 14 * 60_000 || input.runAt !== input.rangeTo || input.channel || input.meetingAt) throw new AppError(400, 'デバッグの期間・実行時刻が不正、または受付期限切れです。');
-    } else if (deadline <= Date.now() || deadline > Date.now() + 366 * 86400_000) throw new Error('ReservationDateOutOfRange');
+    } else if (input.mode !== 'debug-agenda' && (deadline <= Date.now() || deadline > Date.now() + 366 * 86400_000)) throw new Error('ReservationDateOutOfRange');
+    if (input.mode && (!Number.isSafeInteger(input.rangeFrom) || !Number.isSafeInteger(input.rangeTo) || input.rangeFrom! >= input.rangeTo!)) throw new Error('InvalidAgendaRange');
+    if (input.customRange && (!input.debug || input.rangeTo! > Date.now() || input.rangeTo! - input.rangeFrom! > 31 * 86400_000)) throw new AppError(400, 'デバッグの対象期間は過去31日分以内で指定してください。');
     const state: MeetingState = { ...input, status: 'scheduled', failures: 0, skipped: 0, imageFallbacks: 0, cursorCreated: '', cursorId: '', part: 0, textIndex: 1 };
     // SQL and alarm writes before the first await are atomically persisted.
     this.save(state);
+    if (state.startNotice) await this.env.MEETING_STARTS.getByName(`${state.guild}:${state.id}`).book(state);
     await this.ctx.storage.setAlarm(Math.max(Date.now() + 1, input.runAt));
     return this.summary();
   }
@@ -63,13 +71,17 @@ export class MeetingScheduler extends DurableObject<Env> {
     if (!state) return null;
     const count = this.ctx.storage.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM posts').one().n;
     const pending = this.ctx.storage.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM tasks WHERE done=0').one().n;
-    return { id: state.id, guild: state.guild, runAt: state.runAt, meetingAt: state.meetingAt, channel: state.channel, notificationId: state.notificationId, title: state.title, status: state.status, url: state.url, error: state.error, posts: count, pending, skipped: state.skipped, imageFallbacks: state.imageFallbacks,
-      mode: state.mode, rangeFrom: state.rangeFrom, rangeTo: state.rangeTo, model: state.mode ? DEBUG_MODEL : undefined, reasoningEffort: state.mode ? DEBUG_EFFORT : undefined, requestCount: state.requestCount, reviewedImages: state.reviewedImages };
+    return { id: state.id, guild: state.guild, runAt: state.runAt, meetingAt: state.meetingAt, channel: state.channel, notificationId: state.notificationId, title: state.title, status: state.status, url: state.url, error: state.error, posts: count, pending, skipped: state.skipped, imageFallbacks: state.imageFallbacks, debug: state.debug, previousMinutesId: state.previousMinutesId,
+      mode: state.mode, rangeFrom: state.rangeFrom, rangeTo: state.rangeTo, startNotice: state.startNotice, sourceArchive: state.sourceArchive, sourceGuild: state.sourceGuild, model: state.mode ? DEBUG_MODEL : undefined, reasoningEffort: state.mode ? DEBUG_EFFORT : undefined, requestCount: state.requestCount, reviewedImages: state.reviewedImages };
   }
   async cancel() {
     const state = this.state();
     if (!state) throw new Error('ReservationNotFound');
     if (state.status === 'cancelled') return this.summary();
+    if (state.startNotice && state.meetingAt! > Date.now()) {
+      await this.env.MEETING_STARTS.getByName(`${state.guild}:${state.id}`).cancel();
+      if (this.state()?.status !== 'scheduled') return this.summary();
+    }
     if (state.status !== 'scheduled') throw new Error('ReservationAlreadyStarted');
     state.status = 'cancelled'; state.finished = Date.now(); this.save(state);
     await this.ctx.storage.deleteAlarm();
@@ -84,7 +96,7 @@ export class MeetingScheduler extends DurableObject<Env> {
   }
   private async checkManager(state: MeetingState): Promise<void> {
     const guild = await discord<{ owner_id: string; name?: string }>(this.env, `/guilds/${state.guild}`);
-    if (guild.name) state.projectName = guild.name;
+    if (guild.name && !state.sourceArchive) state.projectName = guild.name;
     if (guild.owner_id === state.user) return;
     const member = await discord<{ roles: string[] }>(this.env, `/guilds/${state.guild}/members/${state.user}`);
     const roles = await discord<{ id: string; permissions: string }[]>(this.env, `/guilds/${state.guild}/roles`);
@@ -93,9 +105,15 @@ export class MeetingScheduler extends DurableObject<Env> {
   }
   private async collect(state: MeetingState): Promise<void> {
     const task = this.ctx.storage.sql.exec<Task>('SELECT id,kind,channel,cursor FROM tasks WHERE done=0 ORDER BY id LIMIT 1').toArray()[0];
-    if (!task) { state.status = state.mode === 'debug-agenda' ? 'generating' : 'preparing'; this.save(state); return; }
+    if (!task) { state.status = state.mode ? 'generating' : 'preparing'; this.save(state); return; }
     if (task.kind === 'bootstrap') {
       await this.checkManager(state);
+      if (state.sourceArchive) {
+        await accessToken(this.env, guildOwner(state.guild));
+        this.task('source-archive', 'source-archive');
+        this.task('source-updates', 'source-updates');
+        this.ctx.storage.sql.exec('UPDATE tasks SET done=1 WHERE id=?', task.id); return;
+      }
       const app = await discord<{ flags?: number; flags_new?: string }>(this.env, '/applications/@me');
       if ((BigInt(app.flags_new ?? app.flags ?? 0) & ((1n << 18n) | (1n << 19n))) === 0n) throw new AppError(400, 'Discord Developer PortalでMessage Content Intentを有効にしてください。本文を読めないため収集を停止しました。');
       // Refresh and scope checks happen before any history is read.
@@ -103,7 +121,7 @@ export class MeetingScheduler extends DurableObject<Env> {
       const channels = await discord<RemoteChannel[]>(this.env, `/guilds/${state.guild}/channels`);
       for (const c of channels.filter(c => [0, 2, 5, 13, 15, 16].includes(c.type))) {
         if (c.guild_id && c.guild_id !== state.guild) throw new Error('GuildMismatch');
-        this.addChannel(c, state.runAt);
+        this.addChannel(c, state.rangeTo ?? state.runAt);
         if ([0, 5, 15, 16].includes(c.type)) this.task(`public:${c.id}`, 'public', c.id);
         if (c.type === 0) {
           this.task(`private:${c.id}`, 'private', c.id);
@@ -111,12 +129,31 @@ export class MeetingScheduler extends DurableObject<Env> {
         }
       }
       this.task('threads-active', 'active');
+    } else if (task.kind === 'source-archive' || task.kind === 'source-updates') {
+      const archive = task.kind === 'source-archive';
+      const rows = archive
+        ? (await this.env.DB.prepare('SELECT id,data,0 AS deleted FROM meeting_agenda_posts WHERE archive=? AND id>? ORDER BY id LIMIT 100').bind(state.sourceArchive, task.cursor ?? '').all<{id:string;data:string;deleted:number}>()).results
+        : (await this.env.DB.prepare('SELECT id,data,deleted FROM cloud_messages WHERE guild=? AND id>? AND created>=? AND created<? ORDER BY id LIMIT 100')
+          .bind(state.sourceGuild, task.cursor ?? '', iso(new Date(state.rangeFrom!).toISOString()), iso(new Date(state.rangeTo!).toISOString())).all<{id:string;data:string;deleted:number}>()).results;
+      for (const row of rows) {
+        if (row.deleted) { this.ctx.storage.sql.exec('DELETE FROM posts WHERE id=?', row.id); continue; }
+        const post: MeetingPost = archive ? JSON.parse(row.data) : storedPost(JSON.stringify(await exportRecord(this.env, { ...row, guild: state.sourceGuild! })));
+        if (Date.parse(post.timestamp) < state.rangeFrom! || Date.parse(post.timestamp) >= state.rangeTo!) continue;
+        const old = this.ctx.storage.sql.exec<{data:string}>('SELECT data FROM posts WHERE id=?', row.id).toArray()[0];
+        if (old) {
+          const previous = JSON.parse(old.data) as MeetingPost;
+          if (iso(previous.edited_timestamp ?? previous.timestamp) > iso(post.edited_timestamp ?? post.timestamp)) continue;
+        }
+        this.ctx.storage.sql.exec('INSERT INTO posts(id,created,data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data', row.id, iso(post.timestamp), JSON.stringify(post));
+      }
+      if (this.ctx.storage.sql.exec<{n:number;bytes:number}>('SELECT COUNT(*) AS n,COALESCE(SUM(length(data)),0) AS bytes FROM posts').toArray().some(r => r.n > 10000 || r.bytes > 8_000_000)) throw new AppError(400, '履歴が多すぎるためアジェンダを作成できませんでした。対象期間を短くしてください。');
+      if (rows.length === 100) { this.ctx.storage.sql.exec('UPDATE tasks SET cursor=? WHERE id=?', rows.at(-1)!.id, task.id); return; }
     } else if (task.kind === 'scan') {
       const messages = await discord<RemoteMessage[]>(this.env, `/channels/${task.channel}/messages?limit=100&before=${task.cursor}`);
       const channel = this.ctx.storage.sql.exec<{ name: string; parent: string | null }>('SELECT name,parent FROM channels WHERE id=?', task.channel).one();
       for (const m of messages) {
         if (m.channel_id !== task.channel) throw new Error('ChannelMismatch');
-        if (Date.parse(m.timestamp) >= state.runAt || (state.rangeFrom !== undefined && Date.parse(m.timestamp) < state.rangeFrom) || m.author.id === this.env.DISCORD_APPLICATION_ID) continue;
+        if (Date.parse(m.timestamp) >= (state.rangeTo ?? state.runAt) || (state.rangeFrom !== undefined && Date.parse(m.timestamp) < state.rangeFrom) || m.author.id === this.env.DISCORD_APPLICATION_ID) continue;
         const post: MeetingPost = { ...m, channel_name: channel.name, parent_id: channel.parent };
         this.ctx.storage.sql.exec('INSERT INTO posts(id,created,data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data', m.id, iso(m.timestamp), JSON.stringify(post));
       }
@@ -137,7 +174,7 @@ export class MeetingScheduler extends DurableObject<Env> {
         if (![10, 11, 12].includes(thread.type) || !thread.parent_id) continue;
         const parent = this.ctx.storage.sql.exec('SELECT id FROM channels WHERE id=? AND parent IS NULL', thread.parent_id).toArray()[0];
         if (!parent || (task.kind !== 'active' && thread.parent_id !== task.channel)) continue;
-        this.addChannel(thread, state.runAt, thread.parent_id);
+        this.addChannel(thread, state.rangeTo ?? state.runAt, thread.parent_id);
       }
       if (task.kind !== 'active' && page.has_more) {
         const last = page.threads.at(-1);
@@ -160,13 +197,21 @@ export class MeetingScheduler extends DurableObject<Env> {
     await this.checkManager(state);
     const posts = this.ctx.storage.sql.exec<{ data: string }>('SELECT data FROM posts ORDER BY created,id').toArray().map(r => JSON.parse(r.data) as MeetingPost);
     if (!state.generationComplete) {
+      if (!state.previousMinutesLoaded) {
+        const previous = await previousMeetingMinutes(this.env, state);
+        this.ctx.storage.sql.exec('INSERT OR REPLACE INTO agenda_previous(id,data) VALUES(1,?)', JSON.stringify(previous));
+        state.previousMinutesId = previous?.id;
+        state.previousMinutesLoaded = true; this.save(state);
+        await this.ctx.storage.sync();
+      }
+      const previous = JSON.parse(this.ctx.storage.sql.exec<{ data: string }>('SELECT data FROM agenda_previous WHERE id=1').one().data) as PreviousMinutes | null;
       const apiKey = (this.env as Env & { OPENAI_API_KEY?: string }).OPENAI_API_KEY;
       if (!apiKey) throw new AppError(400, 'OPENAI_API_KEYをWorkerのSecretへ設定してください。');
       state.generationStarted = true; this.save(state);
       await this.ctx.storage.setAlarm(Date.now() + 15 * 60_000);
       await this.ctx.storage.sync();
       let result: DebugResult;
-      try { result = await createDebugAgenda(posts, state, apiKey); }
+      try { result = await createDebugAgenda(posts, state, apiKey, previous ?? undefined); }
       catch (error) {
         if (error instanceof AppError) throw error;
         throw new AppError(400, `アジェンダ生成を停止しました（${error instanceof Error && /^[A-Z_0-9]+$/.test(error.message) ? error.message : 'GENERATION_FAILED'}）。AI生成は自動再試行しません。`);
@@ -183,7 +228,7 @@ export class MeetingScheduler extends DurableObject<Env> {
       const flush = () => { if (text) { this.ctx.storage.sql.exec('INSERT INTO parts(n,kind,value) VALUES(?,?,?)', state.part++, 'markdown', text); text = ''; } };
       for (const p of agendaParts(result, posts)) {
         if (p.kind === 'image') { flush(); this.ctx.storage.sql.exec('INSERT INTO parts(n,kind,value) VALUES(?,?,?)', state.part++, p.kind, p.value); }
-        else for (const chunk of splitText(p.value)) { if (text.length + chunk.length > 12_000) flush(); text += chunk; }
+        else for (const chunk of splitAgendaText(p.value)) { if (text.length + chunk.length > 12_000) flush(); text += chunk; }
       }
       flush(); state.status = 'adding'; this.task('docs-add', 'docs'); this.save(state);
     });
@@ -228,7 +273,10 @@ export class MeetingScheduler extends DurableObject<Env> {
   }
   private async writePart(state: MeetingState): Promise<void> {
     const part = this.ctx.storage.sql.exec<Part>("SELECT * FROM parts WHERE status<>'done' ORDER BY n LIMIT 1").toArray()[0];
-    if (!part) { state.status = state.channel ? 'summarizing' : 'complete'; state.finished = Date.now(); this.save(state); return; }
+    if (!part) {
+      if (state.startNotice && state.url) await this.env.MEETING_STARTS.getByName(`${state.guild}:${state.id}`).documentReady(state.url);
+      state.status = state.channel && !state.startNotice ? 'summarizing' : 'complete'; state.finished = Date.now(); this.save(state); return;
+    }
     if (part.status === 'writing') throw new AppError(409, '本文・画像の書き込み結果が不明です。作成済みタブを確認してください。');
     let requests: Record<string, unknown>[];
     if (part.kind === 'image') {
@@ -264,6 +312,11 @@ export class MeetingScheduler extends DurableObject<Env> {
     state.imageFallbacks++; this.save(state);
   }
   private async summarize(state: MeetingState): Promise<void> {
+    if (state.mode) {
+      const result: DebugResult = JSON.parse(this.ctx.storage.sql.exec<{data:string}>('SELECT data FROM agenda_result WHERE id=1').one().data);
+      state.agendaLines = result.agenda.summary.slice(0, 3).map(p => p.text);
+      state.status = 'notifying'; this.save(state); return;
+    }
     // Read bounded text parts in chronological order, retaining the merged summary.
     const part = this.ctx.storage.sql.exec<Part>("SELECT * FROM parts WHERE kind='text' AND n>=? ORDER BY n LIMIT 1", state.summaryPart ?? 0).toArray()[0];
     const total = this.ctx.storage.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM posts').one().n;
@@ -282,14 +335,16 @@ export class MeetingScheduler extends DurableObject<Env> {
     await this.checkManager(state);
     const channel = await discord<RemoteChannel>(this.env, `/channels/${state.channel}`);
     if (channel.guild_id !== state.guild) throw new AppError(403, '通知先のサーバーが一致しません。');
-    if (!state.url || state.agendaLines?.length !== 3) throw new AppError(400, '完成通知の情報が不足しています。');
-    const content = `@everyone\nMTG日時: ${jst(state.meetingAt ?? state.runAt)} JST\n${notificationText(state.title)} の資料が完成しました。\n${state.url}\n議題の要約:\n${state.agendaLines.map(line => `・${notificationText(line)}`).join('\n')}${state.skipped ? '\n※取得できなかったチャンネル・スレッドがあります。' : ''}`;
+    if (!state.url || (!state.mode && state.agendaLines?.length !== 3)) throw new AppError(400, '完成通知の情報が不足しています。');
+    if (state.startNotice && (await this.env.MEETING_STARTS.getByName(`${state.guild}:${state.id}`).summary())?.status === 'cancelled') { state.status = 'complete'; this.save(state); return; }
+    const content = state.mode ? `${notificationText(state.title)}のアジェンダができました。\n${state.url}`
+      : `@everyone\nMTG日時: ${jst(state.meetingAt ?? state.runAt)} JST\n${notificationText(state.title)} の資料が完成しました。\n${state.url}\n議題の要約:\n${state.agendaLines!.map(line => `・${notificationText(line)}`).join('\n')}${state.skipped ? '\n※取得できなかったチャンネル・スレッドがあります。' : ''}`;
     state.notificationAttempted = true; this.save(state);
     await this.ctx.storage.sync();
     const response = await fetch(`https://discord.com/api/v10/channels/${state.channel}/messages`, {
       method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(20_000),
       headers: { Authorization: `Bot ${this.env.DISCORD_BOT_TOKEN}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content, allowed_mentions: { parse: ['everyone'] }, nonce: state.id, enforce_nonce: true }),
+      body: JSON.stringify({ content, allowed_mentions: { parse: state.mode ? [] : ['everyone'] }, nonce: state.id, enforce_nonce: true }),
     });
     if (response.status === 429) {
       const body = await response.json() as { retry_after?: number };
@@ -304,8 +359,8 @@ export class MeetingScheduler extends DurableObject<Env> {
     const result = await response.json() as { id?: string; mention_everyone?: boolean };
     if (!result.id) throw new Error('NotificationUncertain');
     state.notificationId = result.id;
-    state.status = result.mention_everyone ? 'complete' : 'notification_failed';
-    if (!result.mention_everyone) state.error = '通知は投稿されましたが全員メンションが無効でした。Botに全員メンション権限を設定してください。';
+    state.status = state.mode || result.mention_everyone ? 'complete' : 'notification_failed';
+    if (!state.mode && !result.mention_everyone) state.error = '通知は投稿されましたが全員メンションが無効でした。Botに全員メンション権限を設定してください。';
     this.save(state);
   }
   async alarm(): Promise<void> {

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { generateAgenda, prepare, validateAgenda, type Message, type Point, type Agenda } from '../src/agenda/index';
 import { agendaDocsInput } from '../src/agenda/docs-input';
 import { renderTemplate } from '../src/template';
-import { agendaParts, agendaTextRequests } from '../src/debug-agenda';
+import { agendaParts, agendaTextRequests, splitAgendaText } from '../src/debug-agenda';
 
 const message = (overrides: Partial<Message> = {}): Message => ({ guild_id: '100', channel_id: '200', message_id: '300',
   created_at: '2026-09-14T01:00:00Z', content: '試験を完了。次回は結果を比較したい。', department: '開発',
@@ -96,7 +96,7 @@ test('new template preserves evidence and decisions while omitting empty fields 
   const result = await generateAgenda({...input(),coverageNotes:['生成内部メモ']},options(async()=>response(a)));
   assert.equal(result.templateVersion,'weekly-agenda-v2');
   const md = result.markdown;
-  assert.match(md,/開催日時：2026-09-15 18:00 JST/);
+  assert.doesNotMatch(md,/開催日時|対象期間/);
   assert.match(md,/- \*\*成果：\*\* 荷重20 N/);
   assert.match(md,/### 議題① 追加試験を実施するか/);
   assert.equal(md.match(/\*\*判断材料：\*\*/g)?.length,1);
@@ -111,6 +111,29 @@ test('new template preserves evidence and decisions while omitting empty fields 
   const styled=agendaTextRequests('- 成果：荷重20 N\n関係者：@開発／判断期限：要確認\n','t.agenda',42);
   const bold=styled.requests.flatMap((r:any)=>r.updateTextStyle?.textStyle.bold?[r.updateTextStyle.range]:[]);
   assert.deepEqual(bold.map((r:any)=>styled.text.slice(r.startIndex-42,r.endIndex-42)),['成果：','関係者：','判断期限：']);
+});
+test('citations are stable superscript numbers; Docs links have correct offsets after emoji, headings and images', async () => {
+  const a = agenda();
+  a.summary = [point({ text: '絵文字😀の結果', sourceIds: ['300', '301', '300'] })];
+  const result = await generateAgenda(input([message(), message({ message_id: '301', attachments: [] })]), options(async () => response(a)));
+  assert.match(result.markdown, /\[¹\]\(https:\/\/discord.com\/channels\/100\/200\/300\) \[²\]/);
+  const parts = agendaParts(result, []);
+  const styled = agendaTextRequests(parts.map(p => p.value).join(''), 't.after-image', 42);
+  assert.doesNotMatch(styled.text, /https:|元投稿|開催日時|対象期間/);
+  const refs = styled.requests.flatMap((r: any) => r.updateTextStyle?.textStyle.baselineOffset === 'SUPERSCRIPT' ? [r.updateTextStyle] : []);
+  assert.ok(refs.length >= 3);
+  for (const ref of refs) {
+    assert.equal(ref.range.tabId, 't.after-image');
+    const number = styled.text.slice(ref.range.startIndex - 42, ref.range.endIndex - 42);
+    assert.equal(number, ref.textStyle.link.url.endsWith('/300') ? '1' : '2');
+    assert.equal(ref.textStyle.underline, false);
+  }
+  const long = 'あ'.repeat(11990) + '[¹²](https://discord.com/channels/100/200/300)\n後続😀\n';
+  const chunks = splitAgendaText(long);
+  assert.equal(chunks.join(''), long);
+  const requests = chunks.flatMap(c => agendaTextRequests(c, 't.long', 1).requests);
+  assert.equal(requests.filter((r: any) => r.updateTextStyle?.textStyle.baselineOffset === 'SUPERSCRIPT').length, 1);
+  assert.ok(chunks.every(c => c.length <= 12000));
 });
 test('provider failures are bounded and do not echo secret bodies', async () => {
   await assert.rejects(generateAgenda(input(), options(async () => new Response(null, { status: 302, headers: { Location: 'https://example.com' } }))), /OPENAI_HTTP_302/);

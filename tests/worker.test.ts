@@ -110,7 +110,7 @@ before(async () => {
     },
   }));
   const db = await mf.getD1Database('DB');
-  for (const file of ['0001_initial.sql', '0002_discord_users.sql', '0003_collector_commands.sql', '0004_discord_guild_settings.sql', '0007_discord_profiles.sql']) {
+  for (const file of ['0001_initial.sql', '0002_discord_users.sql', '0003_collector_commands.sql', '0004_discord_guild_settings.sql', '0007_discord_profiles.sql', '0010_guild_meeting_settings.sql', '0013_meeting_voice_channel.sql']) {
     const migration = await readFile(`migrations/${file}`, 'utf8');
     for (const sql of migration.split(';').map(v => v.trim()).filter(Boolean)) await db.prepare(sql).run();
   }
@@ -546,4 +546,52 @@ test('サーバープロフィールを未接続から認証・保存先変更�
   await api(`/api/discord/profile?guild=${guild}`, 'POST');
   await waitProfile(/Google: 設定されてないです/);
   assert.ok(profiles.get(guild)!.includes(documentB));
+});
+
+
+test('/settings isolates guild settings and enforces manager rights on every interaction', async () => {
+  const invoke = async (type: number, data: object, permissions = '32', guild = discordGuildA) => {
+    const input = { ...discordPayload('settings', discordUserA, [], guild), type, data, member: { user: { id: discordUserA }, permissions } };
+    const response = await (await discordRequest(input)).json() as any;
+    return { input, response };
+  };
+  let result = await invoke(2, { name: 'settings' });
+  assert.equal(result.response.data.flags, 64);
+  assert.match(result.response.data.content, /7日後 ± 2日/);
+  result = await invoke(3, { custom_id: 'settings:range' });
+  assert.equal(result.response.type, 9);
+  const range = (center: string, radius: string) => ({ custom_id: 'settings:save-range', components: [{ components: [{ custom_id: 'center', value: center }] }, { components: [{ custom_id: 'radius', value: radius }] }] });
+  for (const [c, r] of [['7','3'], ['0','0'], ['7','15'], ['3','4'], ['365','1'], ['7.5','2']]) {
+    result = await invoke(5, range(c, r), '0');
+    assert.equal(result.response.type, 4);
+    assert.match(result.response.data.content, /管理権限/);
+  }
+  result = await invoke(5, range('3', '4'));
+  assert.equal(result.response.type, 4);
+  result = await invoke(5, range('7', '3'));
+  assert.equal(result.response.type, 6);
+  assert.match((await awaitReply(result.input.token)).content, /7日後 ± 3日/);
+  result = await invoke(2, { name: 'settings' }, '32', discordGuildB);
+  assert.match(result.response.data.content, /7日後 ± 2日/);
+  result = await invoke(3, { custom_id: 'settings:channel', values: ['678901234567890123'], resolved: { channels: { '678901234567890123': { type: 0 } } } });
+  assert.equal(result.response.type, 6);
+  assert.match((await awaitReply(result.input.token)).content, /<#678901234567890123>/);
+  result = await invoke(3, { custom_id: 'settings:channel', values: ['678901234567890123'] });
+  assert.equal(result.response.type, 4);
+  for (const type of [0, 5, 13]) {
+    result = await invoke(3, { custom_id: 'settings:voice-channel', values: ['678901234567890124'], resolved: { channels: { '678901234567890124': { type } } } });
+    assert.equal(result.response.type, 4);
+  }
+  result = await invoke(3, { custom_id: 'settings:voice-channel', values: ['678901234567890124'], resolved: { channels: { '678901234567890124': { type: 2 } } } });
+  assert.equal(result.response.type, 6);
+  const voiceReply = await awaitReply(result.input.token);
+  assert.match(voiceReply.content, /通話チャンネル：<#678901234567890124>/);
+  assert.match(voiceReply.content, /通知先：<#678901234567890123>/);
+  result = await invoke(3, { custom_id: 'settings:reset-channel' });
+  assert.equal(result.response.type, 6);
+  const reply = await awaitReply(result.input.token);
+  assert.match(reply.content, /コマンドを実行したチャンネル/);
+  assert.match(reply.content, /7日後 ± 3日/);
+  assert.match(reply.content, /通話チャンネル：<#678901234567890124>/);
+  assert.deepEqual(reply.allowed_mentions.parse, []);
 });
