@@ -1,4 +1,5 @@
 export const discordCommands = [
+  { name: 'settings', type: 1, description: 'このサーバーのMTG候補日・通知チャンネルを設定します', default_member_permissions: '32' },
   {
     name: 'mtg', type: 1, description: '日時を予約して全履歴を収集し、Google Docsのタブへ記録', default_member_permissions: '32',
     options: [

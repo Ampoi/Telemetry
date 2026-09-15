@@ -133,3 +133,40 @@ test('member list failure does not open a poll with a partial roster; refresh re
   finally { memberListDenied=false; }
   await configure(id);
 });
+
+test('manual confirmation requires the owner and a valid single slot, books and notifies once',async()=>{
+  const id=await create();const initial=await configure(id);
+  assert.equal((await call(id,'confirm','unknown',{slot:114})).status,401);
+  assert.equal((await call(id,'confirm',guest,{slot:114})).status,403);
+  assert.equal((await call(id,'confirm',owner,{slot:114},{Origin:'https://evil.example'})).status,403);
+  for(const slot of [null,'114',-1,240,1.5])assert.equal((await call(id,'confirm',owner,{slot})).status,400);
+  const results=await Promise.all([call(id,'confirm',owner,{slot:114}),call(id,'confirm',owner,{slot:115})]);
+  assert.deepEqual(results.map(r=>r.status).sort(),[200,409]);
+  const accepted=await results.find(r=>r.status===200)!.json() as any;
+  let data:any;
+  for(let i=0;i<150;i++){data=await(await call(id,'data')).json();if(data.notified)break;await new Promise(r=>setTimeout(r,20));}
+  assert.equal(data.status,'confirmed');assert.equal(data.notified,true);
+  assert.equal(data.meetingAt,accepted.meetingAt);assert.ok([114,115].includes((data.meetingAt-initial.start)/SLOT));
+  assert.ok(data.members.every((m:any)=>!m.answered));
+  assert.equal((await call(id,'answer',guest,{slots:[116]})).status,409);
+  assert.equal((await call(id,'confirm',owner,{slot:116})).status,409);
+  const notices=notifications.filter(n=>n.nonce===id);assert.equal(notices.length,1);
+  assert.match(notices[0].content,/^次のMTG日時は.+（日本時間）です！$/);assert.deepEqual(notices[0].allowed_mentions,{parse:[]});
+  const row=await(await mf.getD1Database('DB')).prepare('SELECT meeting_at,run_at FROM meeting_reservations WHERE id=?').bind(id).first<any>();
+  assert.equal(row.meeting_at,data.meetingAt);assert.equal(row.run_at,data.meetingAt-3600_000);
+});
+
+test('manual confirmation races with automatic confirmation without overwriting or double notification',async()=>{
+  const id=await create();await configure(id);await call(id,'answer',guest,{slots:[114]});
+  await Promise.all([call(id,'answer',owner,{slots:[114]}),call(id,'confirm',owner,{slot:116})]);
+  let data:any;
+  for(let i=0;i<150;i++){data=await(await call(id,'data')).json();if(data.notified)break;await new Promise(r=>setTimeout(r,20));}
+  assert.equal(data.status,'confirmed');assert.ok([114,116].includes((data.meetingAt-data.start)/SLOT));
+  assert.equal(notifications.filter(n=>n.nonce===id).length,1);
+  assert.equal((await call(id,'confirm',owner,{slot:117})).status,409);
+});
+
+test('cancelled polls reject manual confirmation',async()=>{
+  const id=await create();await configure(id);await call(id,'cancel',owner,{});
+  assert.equal((await call(id,'confirm',owner,{slot:114})).status,409);
+});

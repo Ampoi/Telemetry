@@ -2,7 +2,7 @@ import { appOrigin } from './auth';
 import { DurableObject } from 'cloudflare:workers';
 import { discord, DiscordError } from './cloud/discord-rest';
 import { jst, type MeetingInput } from './meeting-model';
-import { meetingTitle, commonSlot, windowStart, DAY, type PollInput, type PollState } from './meeting-poll-model';
+import { pollDays, meetingTitle, commonSlot, windowStart, DAY, SLOT, type PollInput, type PollState } from './meeting-poll-model';
 
 // A single serialized state per poll prevents simultaneous answers from choosing
 // different dates. The alarm durably bridges the poll to the existing scheduler.
@@ -20,7 +20,7 @@ export class MeetingPoll extends DurableObject<Env> {
   }
   async create(input: PollInput) {
     const exists = this.ctx.storage.sql.exec('SELECT id FROM poll WHERE id=1').toArray().length;
-    if (!exists) this.save({ ...input, start: windowStart(input.created), title: '定例mtg', status: 'draft', members: [], answers: {} });
+    if (!exists) this.save({ ...input, start: windowStart(input.created, input.centerDays, input.radiusDays), title: '定例mtg', status: 'draft', members: [], answers: {} });
     return { id: input.id };
   }
   async announce(): Promise<'sent' | 'unconfirmed' | 'failed' | 'unmentioned'> {
@@ -54,8 +54,8 @@ export class MeetingPoll extends DurableObject<Env> {
   view(user: string) {
     const p = this.state();
     if (user !== p.user && !p.members.some(m => m.id === user)) throw new Error('PollForbidden');
-    const counts = Array.from({ length: 240 }, (_, i) => p.members.filter(m => p.answers[m.id]?.includes(i)).length);
-    return { id: p.id, start: p.start, duration: p.duration, title: p.title, status: p.status, owner: user === p.user,
+    const counts = Array.from({ length: pollDays(p) * 48 }, (_, i) => p.members.filter(m => p.answers[m.id]?.includes(i)).length);
+    return { id: p.id, start: p.start, days: pollDays(p), centerDays: p.centerDays ?? 7, duration: p.duration, title: p.title, status: p.status, owner: user === p.user,
       members: p.members.map(m => ({ ...m, answered: Object.hasOwn(p.answers, m.id) })), counts, mine: p.answers[user] ?? [],
       answered: Object.hasOwn(p.answers, user), meetingAt: p.meetingAt, error: p.error, notified: p.notified };
   }
@@ -76,8 +76,8 @@ export class MeetingPoll extends DurableObject<Env> {
       }
       if (!members.has(user)) throw new Error('PollForbidden');
       p.members = [...members.values()]; p.duration = undefined; p.title = '定例mtg';
-      p.status = Date.now() >= p.start + 5 * DAY ? 'cancelled' : 'open';
-      if (p.status === 'open') await this.ctx.storage.setAlarm(p.start + 5 * DAY);
+      p.status = Date.now() >= p.start + pollDays(p) * DAY ? 'cancelled' : 'open';
+      if (p.status === 'open') await this.ctx.storage.setAlarm(p.start + pollDays(p) * DAY);
       this.save(p);
       } catch (error) {
         if (error instanceof DiscordError) return error.httpStatus === 403 ? 'MemberListForbidden' : 'MemberListUnavailable';
@@ -91,13 +91,25 @@ export class MeetingPoll extends DurableObject<Env> {
     const p = this.state();
     if (!p.members.some(m => m.id === user)) throw new Error('PollForbidden');
     if (p.status !== 'open') throw new Error('PollClosed');
-    if (Date.now() >= p.start + 5 * DAY) throw new Error('PollExpired');
-    if (!Array.isArray(slots) || slots.length > 240 || slots.some(n => !Number.isInteger(n) || n < 0 || n >= 240)) throw new Error('InvalidSlots');
+    if (Date.now() >= p.start + pollDays(p) * DAY) throw new Error('PollExpired');
+    if (!Array.isArray(slots) || slots.length > pollDays(p) * 48 || slots.some(n => !Number.isInteger(n) || n < 0 || n >= pollDays(p) * 48)) throw new Error('InvalidSlots');
     p.answers[user] = [...new Set(slots)];
     const at = commonSlot(p, Date.now());
     if (at !== undefined) { p.meetingAt = at; p.title = meetingTitle(at); p.status = 'booking'; }
     this.save(p);
     if (p.status === 'booking') await this.ctx.storage.setAlarm(Date.now() + 1);
+    return this.view(user);
+  }
+  async confirm(user: string, slot: number) {
+    const p = this.state();
+    if (p.user !== user) throw new Error('PollForbidden');
+    if (p.status !== 'open') throw new Error('PollClosed');
+    if (!Number.isInteger(slot) || slot < 0 || slot >= pollDays(p) * 48) throw new Error('InvalidSlot');
+    const at = p.start + slot * SLOT;
+    if (at <= Date.now() + 3600_000) throw new Error('InvalidMeetingTime');
+    p.meetingAt = at; p.title = meetingTitle(at); p.status = 'booking';
+    this.save(p);
+    await this.ctx.storage.setAlarm(Date.now() + 1);
     return this.view(user);
   }
   async cancel(user: string) {
@@ -110,8 +122,8 @@ export class MeetingPoll extends DurableObject<Env> {
   async alarm() {
     const p = this.state();
     if (p.status === 'open') {
-      if (Date.now() >= p.start + 5 * DAY) { p.status = 'cancelled'; p.error = '候補期間が終了しました。新しい日程調整を作成してください。'; this.save(p); }
-      else await this.ctx.storage.setAlarm(p.start + 5 * DAY);
+      if (Date.now() >= p.start + pollDays(p) * DAY) { p.status = 'cancelled'; p.error = '候補期間が終了しました。新しい日程調整を作成してください。'; this.save(p); }
+      else await this.ctx.storage.setAlarm(p.start + pollDays(p) * DAY);
       return;
     }
     if (p.status !== 'booking') return;
@@ -133,7 +145,7 @@ export class MeetingPoll extends DurableObject<Env> {
         const response = await fetch(`https://discord.com/api/v10/channels/${p.channel}/messages`, {
           method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(15_000),
           headers: { Authorization: `Bot ${this.env.DISCORD_BOT_TOKEN}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ content: `次回MTGが確定しました。\n${jst(p.meetingAt!)} JST`, allowed_mentions: { parse: [] }, nonce: p.id, enforce_nonce: true }),
+          body: JSON.stringify({ content: `次のMTG日時は${jst(p.meetingAt!)}（日本時間）です！`, allowed_mentions: { parse: [] }, nonce: p.id, enforce_nonce: true }),
         });
         if (!response.ok) { await response.body?.cancel(); throw new Error('NotificationFailed'); }
         const message = await response.json() as { id?: string };

@@ -91,7 +91,7 @@ export async function meetingWeb(request: Request, env: MeetingWebEnv): Promise<
     await env.DB.prepare('DELETE FROM meeting_sessions WHERE token_hash=?').bind(await hash(cookie(request, 'mtg_session'))).run();
     return Response.json({ ok: true }, { headers: { 'Set-Cookie': setCookie(env, 'mtg_session', '', 0) } });
   }
-  const match = url.pathname.match(/^\/mtg\/polls\/(\d{17,20})(?:\/(data|answer|cancel))?$/);
+  const match = url.pathname.match(/^\/mtg\/polls\/(\d{17,20})(?:\/(data|answer|cancel|confirm))?$/);
   if (!match) throw new AppError(404, 'ページが見つかりません。');
   const row = await poll(env, match[1]);
   if (!match[2] && request.method === 'GET') return meetingPage(row.id);
@@ -111,8 +111,14 @@ export async function meetingWeb(request: Request, env: MeetingWebEnv): Promise<
     }
     if (match[2] === 'answer' && request.method === 'POST') {
       const data = await jsonBody(request);
-      if (!Array.isArray(data.slots) || data.slots.length > 240 || data.slots.some(n => !Number.isInteger(n) || n < 0 || n >= 240)) throw new AppError(400, '空き時間の指定が不正です。');
+      if (!Array.isArray(data.slots) || data.slots.length > 1392 || data.slots.some(n => !Number.isInteger(n) || n < 0 || n >= 1392)) throw new AppError(400, '空き時間の指定が不正です。');
       return Response.json(await stub.answer(current.user, data.slots));
+    }
+    if (match[2] === 'confirm' && request.method === 'POST') {
+      await manager(env, row, current.user);
+      const data = await jsonBody(request);
+      if (typeof data.slot !== 'number' || !Number.isInteger(data.slot) || data.slot < 0 || data.slot >= 1392) throw new AppError(400, '表から開始時刻を1つ選んでください。');
+      return Response.json(await stub.confirm(current.user, data.slot));
     }
     if (match[2] === 'cancel' && request.method === 'POST') { await manager(env, row, current.user); return Response.json(await stub.cancel(current.user)); }
   } catch (error) {
@@ -121,6 +127,7 @@ export async function meetingWeb(request: Request, env: MeetingWebEnv): Promise<
     if (message.includes('MemberList')) throw new AppError(503, message.includes('MemberListForbidden') ? 'メンバーを取得できません。サーバー管理者にBotのServer Members Intent設定を確認してもらってください。' : 'メンバーを取得できませんでした。少し待ってページを更新してください。');
     if (message.includes('PollForbidden')) throw new AppError(403, 'この日程調整の参加者ではありません。サーバーの所属を確認してください。');
     if (/PollClosed|PollExpired/.test(message)) throw new AppError(409, '募集を終了しています。ページを更新してください。');
+    if (message.includes('InvalidMeetingTime')) throw new AppError(400, '現在から1時間より先の開始時刻を選んでください。');
     if (/Invalid/.test(message)) throw new AppError(400, '入力内容を確認して、もう一度お試しください。');
     throw error;
   }

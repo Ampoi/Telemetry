@@ -1,3 +1,4 @@
+import { settingsInteraction } from './guild-settings';
 import { createLogin } from './auth';
 import { decrypt } from './crypto';
 import { AppError } from './errors';
@@ -17,7 +18,7 @@ export interface Interaction {
   channel_id?: string;
   member?: { user?: { id: string }; permissions?: string };
   user?: { id: string };
-  data?: { name: string; options?: { name: string; type: number; value: unknown; options?: { name: string; type: number; value: unknown }[] }[] };
+  data?: { name?: string; custom_id?: string; values?: string[]; resolved?: { channels?: Record<string, { type: number }> }; components?: { components?: { custom_id?: string; value?: string }[] }[]; options?: { name: string; type: number; value: unknown; options?: { name: string; type: number; value: unknown }[] }[] };
 }
 // Drain jobs queued before /create was removed without creating new tabs.
 interface CreateJob { applicationId: string; token: string; expiresAt: number }
@@ -62,13 +63,15 @@ export async function handleDiscord(request: Request, env: Env, ctx: ExecutionCo
   try { interaction = JSON.parse(raw); } catch { throw new AppError(400, 'Invalid interaction JSON.'); }
   if (!interaction || interaction.application_id !== env.DISCORD_APPLICATION_ID) throw new AppError(401, 'Discord application mismatch.');
   if (interaction.type === 1) return Response.json({ type: 1 });
-  if (interaction.type !== 2) return ephemeral('対応しているコマンドは /auth・/document・/telemetry・/mtg です。');
+  if (![2, 3, 5].includes(interaction.type)) return ephemeral('/settings または /mtg を実行してください。');
   const userId = interaction.member?.user?.id ?? interaction.user?.id;
   if (!userId || !/^\d{17,20}$/.test(userId) || !/^\d{17,20}$/.test(interaction.id) || typeof interaction.token !== 'string' || !interaction.token) throw new AppError(400, 'Discord user or interaction missing.');
   try {
+    if ((interaction.type === 2 && interaction.data?.name === 'settings') || ([3, 5].includes(interaction.type) && interaction.data?.custom_id?.startsWith('settings:'))) return await settingsInteraction(interaction, env, ctx);
+    if (interaction.type !== 2) return ephemeral('/settings を開き直してください。');
     if (interaction.data?.name === 'mtg') return await meetingInteraction(interaction, env, ctx);
     if (interaction.data?.name === 'telemetry') return await (env.COLLECTION_MODE === 'cloud' ? cloudInteraction(interaction, env, ctx) : acceptCollector(interaction, env));
-    if (!['auth', 'document'].includes(interaction.data?.name ?? '')) return ephemeral('対応しているコマンドは /auth・/document・/telemetry・/mtg です。');
+    if (!['auth', 'document'].includes(interaction.data?.name ?? '')) return ephemeral('対応しているコマンドは /auth・/document・/telemetry・/mtg・/settings です。');
     const guildId = requireGuildManager(interaction);
     const owner = guildOwner(guildId);
     if (interaction.data?.name === 'auth') {
@@ -101,7 +104,7 @@ export async function handleDiscord(request: Request, env: Env, ctx: ExecutionCo
       refreshProfile(env, ctx, guildId);
       return ephemeral(`このサーバーの保存先: ${profile.documentUrl ?? '未設定（/document document:URL で設定）'}\nGoogle接続: ${profile.connected ? `登録済み（有効性は作成時に確認）\nメール: ${profile.email ?? '未取得（/auth で再接続）'}` : '未接続（/auth で接続）'}`);
     }
-    return ephemeral('対応しているコマンドは /auth・/document・/telemetry・/mtg です。');
+    return ephemeral('対応しているコマンドは /auth・/document・/telemetry・/mtg・/settings です。');
   } catch (error) {
     return ephemeral(error instanceof AppError ? error.message : '設定を確認してください。Google OAuth・D1・Discordの設定が必要です。');
   }

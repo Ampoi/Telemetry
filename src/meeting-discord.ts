@@ -1,3 +1,4 @@
+import { meetingSettings } from './guild-settings';
 import { AppError } from './errors';
 import { guildOwner, requireGuildManager } from './discord-guild';
 import { jst } from './meeting-model';
@@ -48,9 +49,10 @@ export async function meetingInteraction(interaction: Interaction, env: Env, ctx
         const setting = await env.DB.prepare('SELECT document_id FROM discord_guild_settings WHERE guild_id=?').bind(guild).first<{ document_id: string }>();
         if (!setting) throw new AppError(400, '先に /document document:URL で保存先を設定してください。');
         if (!await env.DB.prepare('SELECT id FROM credentials WHERE id=?').bind(guildOwner(guild)).first()) throw new AppError(400, '先に /auth でこのサーバーをGoogleに接続してください。');
+        const preferences = await meetingSettings(env, guild);
         await env.DB.prepare('INSERT OR IGNORE INTO meeting_polls(id,guild,user,created) VALUES(?,?,?,?)').bind(interaction.id, guild, interaction.member!.user!.id, Date.now()).run();
         const row = await env.DB.prepare('SELECT created FROM meeting_polls WHERE id=?').bind(interaction.id).first<{ created: number }>();
-        await env.MEETING_POLLS.getByName(interaction.id).create({ id: interaction.id, guild, user: interaction.member!.user!.id, channel: interaction.channel_id, document: setting.document_id, created: row!.created });
+        await env.MEETING_POLLS.getByName(interaction.id).create({ id: interaction.id, guild, user: interaction.member!.user!.id, channel: preferences.channel_id ?? interaction.channel_id, centerDays: preferences.center_days, radiusDays: preferences.radius_days, document: setting.document_id, created: row!.created });
         const url = `${appOrigin(env)}/mtg/polls/${interaction.id}`;
         components = [{ type: 1, components: [{ type: 2, style: 5, label: '日程調整を開く', url }] }];
         const invitation = await env.MEETING_POLLS.getByName(interaction.id).announce();

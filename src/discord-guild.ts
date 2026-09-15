@@ -11,7 +11,7 @@ export function requireGuildManager(interaction: { guild_id?: string; member?: {
   }
   const permissions = interaction.member.permissions ?? '';
   if (!/^\d+$/.test(permissions) || (BigInt(permissions) & (32n | 8n)) === 0n) {
-    throw new AppError(403, 'Google連携の認証・ドキュメント設定・作成にはサーバー管理権限が必要です。');
+    throw new AppError(403, 'この操作にはサーバー管理権限が必要です。');
   }
   return guild;
 }

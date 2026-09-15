@@ -8,7 +8,7 @@ async function main() {
   } });
   if (values.help) {
     console.log('--collector-only: 収集専用アプリでは /telemetry だけ登録します。共有アプリでは省略してください。');
-    console.log('pnpm discord:register [--guild SERVER_ID | --global] [--dry-run]\n.env.discord に DISCORD_APPLICATION_ID / DISCORD_BOT_TOKEN を設定してください。\n既定はグローバル登録です。開発者が一度登録すれば、招待先で /auth・/document・/telemetry・/mtg が利用できます。\n--guild は特定サーバーだけで試す場合に指定します。廃止した /create を削除します。その他のコマンドは削除しません。\n--remove-create-only は /create の削除だけを実行します。');
+    console.log('pnpm discord:register [--guild SERVER_ID | --global] [--dry-run]\n.env.discord に DISCORD_APPLICATION_ID / DISCORD_BOT_TOKEN を設定してください。\n既定はグローバル登録です。開発者が一度登録すれば、招待先で /auth・/document・/telemetry・/mtg・/settings が利用できます。\n--guild は特定サーバーだけで試す場合に指定します。廃止した /create を削除します。その他のコマンドは削除しません。\n--remove-create-only は /create の削除だけを実行します。');
     return;
   }
   if (values.global && values.guild) throw new Error('--global と --guild は同時に指定できません。');
