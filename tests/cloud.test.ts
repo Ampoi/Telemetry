@@ -37,6 +37,7 @@ async function seed(m:RemoteMessage){
 before(async()=>{
   mf=new Miniflare(convertV4MiniflareOptions({
     modules:true,scriptPath:'.test-dist/cloud-harness.js',compatibilityDate:'2026-09-15',compatibilityFlags:['nodejs_compat'],
+    durableObjects:{COLLECTION_RECOVERY:{className:'TestCollectionRecovery',useSQLite:true}},
     d1Databases:['DB'],r2Buckets:['MEDIA'],queueProducers:{COLLECTION_JOBS:'test-collection',DISCORD_JOBS:'test-docs'},
     bindings:{APP_ORIGIN:'http://localhost:8787',DEMO_API_KEY:key,DISCORD_BOT_TOKEN:'fake-bot',COLLECTION_MODE:'cloud'},
     outboundService:async request=>{
@@ -157,6 +158,7 @@ test('exports publish only complete parts, use schema v2 and authenticate guild 
 test('real Queue delivery completes backfill and JSONL without a resident collector',async()=>{
   const queued=new Miniflare(convertV4MiniflareOptions({
     modules:true,scriptPath:'dist/index.js',compatibilityDate:'2026-09-15',compatibilityFlags:['nodejs_compat'],
+    durableObjects:{COLLECTION_RECOVERY:{className:'CollectionRecovery',useSQLite:true}},
     d1Databases:['DB'],r2Buckets:['MEDIA'],queueProducers:{COLLECTION_JOBS:'live-collection',DISCORD_JOBS:'live-docs'},
     queueConsumers:{'live-collection':{maxBatchSize:1,maxBatchTimeout:0,maxRetries:2}},
     bindings:{APP_ORIGIN:'http://localhost:8787',DEMO_API_KEY:key,DISCORD_BOT_TOKEN:'fake-bot',COLLECTION_MODE:'cloud'},
@@ -185,7 +187,7 @@ test('real Queue delivery completes backfill and JSONL without a resident collec
     const file=await call(`/exports/${exported.id}/parts/0`);assert.equal(file.status,200);assert.equal(JSON.parse((await file.text()).trim()).content,'投稿5');
   }finally{await queued.dispose();}
 });
-test('backfill acceptance is atomic across concurrent calls and persists outbox for Cron recovery',async()=>{
+test('backfill acceptance is atomic across concurrent calls and persists outbox for alarm recovery',async()=>{
   const database=await db();
   const results=await Promise.all([api('/backfill','POST',{days:7}),api('/backfill','POST',{days:30})]);
   assert.deepEqual(results.map(r=>r.status).sort(),[202,409]);
@@ -221,4 +223,18 @@ test('newly discovered threads recover from guild start rather than only the ove
   const child=await(await db()).prepare('SELECT payload FROM cloud_tasks WHERE id=?').bind(`${id}:thread:${thread}`).first<{payload:string}>();
   assert.equal(JSON.parse(child!.payload).start,now-86400_000);
   await(await db()).prepare("UPDATE cloud_tasks SET status='done' WHERE id=? OR id=?").bind(id,`${id}:thread:${thread}`).run();
+});
+test('recovery alarm retains active work and future cleanup, then stops without creating scans',async()=>{
+  const isolated='999999999999999998',database=await db();
+  await database.prepare('INSERT INTO cloud_guilds(guild,bot_id,config,started) VALUES(?,?,?,?)').bind(isolated,bot,JSON.stringify(config({channels:[{id:channel}]})),Date.now()).run();
+  assert.equal((await harness('recovery',{guild:isolated,expire:true}) as {alarm:number|null}).alarm,null);
+  await database.prepare('INSERT INTO cloud_tasks(id,guild,kind,payload,created,updated) VALUES(?,?,?,?,?,?)').bind('recovery-only',isolated,'export','{}',Date.now(),Date.now()).run();
+  assert.ok((await harness('recovery',{guild:isolated,expire:true}) as {alarm:number|null}).alarm);
+  await database.prepare("UPDATE cloud_tasks SET status='done' WHERE id='recovery-only'").run();
+  const due=Date.now()+600_000,key=`guild/${isolated}/unfinished`;
+  await database.prepare('INSERT INTO cloud_cleanup(storage_key,due) VALUES(?,?)').bind(key,due).run();
+  assert.equal((await harness('recovery',{guild:isolated,expire:true}) as {alarm:number|null}).alarm,due);
+  await database.prepare('DELETE FROM cloud_cleanup WHERE storage_key=?').bind(key).run();
+  assert.equal((await harness('recovery',{guild:isolated,expire:true}) as {alarm:number|null}).alarm,null);
+  assert.equal((await database.prepare("SELECT COUNT(*) AS n FROM cloud_tasks WHERE guild=? AND kind='scan'").bind(isolated).first<{n:number}>())!.n,0);
 });

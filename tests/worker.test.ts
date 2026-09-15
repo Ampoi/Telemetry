@@ -128,6 +128,7 @@ test('共有アプリの収集コマンドを署名検証から返信まで中�
 });
 after(async () => { await mf?.dispose(); });
 
+
 function api(path: string, method = 'GET', body?: unknown) {
   return mf.dispatchFetch(`http://localhost:8787${path}`, {
     method, headers: { Authorization: `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
@@ -451,4 +452,60 @@ test('サーバー設定・認証の境界を検証する', async t => {
     assert.match(await result.text(), /サーバー別Google連携/);
     assert.equal(tokenCalls, before);
   });
+});
+test('Google画面で失敗しても同じブラウザなら未完了の認証リンクを再開できる', async () => {
+  const login = await beginLogin();
+  assert.equal((await mf.dispatchFetch(login.url, { redirect: 'manual' })).status, 400);
+  const restarted = await mf.dispatchFetch(login.url, { redirect: 'manual', headers: { Cookie: login.cookie } });
+  assert.equal(restarted.status, 302);
+  const google = new URL(restarted.headers.get('Location')!);
+  assert.notEqual(google.searchParams.get('state'), login.state);
+  const cookie = restarted.headers.get('Set-Cookie')!;
+  assert.match(cookie, /Path=\/auth;/);
+  const before = tokenCalls;
+  assert.equal((await mf.dispatchFetch(`http://localhost:8787/auth/callback?state=${login.state}&code=test-code`, { headers: { Cookie: login.cookie } })).status, 400);
+  assert.equal(tokenCalls, before);
+  expectedChallenge = google.searchParams.get('code_challenge')!;
+  const finished = await mf.dispatchFetch(`http://localhost:8787/auth/callback?state=${google.searchParams.get('state')}&code=test-code`, { headers: { Cookie: cookie.split(';')[0] } });
+  assert.equal(finished.status, 200);
+  assert.equal((await mf.dispatchFetch(login.url, { redirect: 'manual', headers: { Cookie: cookie.split(';')[0] } })).status, 400);
+});
+
+test('同じブラウザで複数サーバーとCLIを認証してもCookieを上書きしない', async () => {
+  const jar = new Map<string, string>();
+  const logins: { owner: string; state: string; challenge: string; cookieName: string }[] = [];
+  for (const guild of [discordGuildA, discordGuildB, undefined]) {
+    let url: string;
+    if (guild) {
+      const response = await (await discordRequest(discordPayload('auth', discordUserA, [], guild))).json() as { data: { components: { components: { url: string }[] }[] } };
+      url = response.data.components[0].components[0].url;
+    } else {
+      url = ((await (await api('/api/auth', 'POST')).json()) as { url: string }).url;
+    }
+    const started = await mf.dispatchFetch(url, { redirect: 'manual' });
+    assert.equal(started.status, 302);
+    const google = new URL(started.headers.get('Location')!);
+    const cookie = started.headers.get('Set-Cookie')!.split(';')[0];
+    const name = cookie.split('=')[0];
+    jar.set(name, cookie);
+    logins.push({ owner: guild ? `discord:guild:${guild}` : 'default', state: google.searchParams.get('state')!, challenge: google.searchParams.get('code_challenge')!, cookieName: name });
+  }
+  assert.equal(jar.size, 3);
+  const db = await mf.getD1Database('DB');
+  for (const [i, login] of logins.entries()) {
+    expectedChallenge = login.challenge;
+    const callback = `http://localhost:8787/auth/callback?state=${login.state}&code=${i === 1 ? 'test-code-b' : 'test-code'}&owner=discord:guild:999999999999999999`;
+    const wrongCookie = [...jar.values()].filter(v => !v.startsWith(`${login.cookieName}=`)).join('; ');
+    const before = tokenCalls;
+    assert.equal((await mf.dispatchFetch(callback, { headers: { Cookie: wrongCookie } })).status, 400);
+    assert.equal(tokenCalls, before);
+    const finished = await mf.dispatchFetch(callback, { headers: { Cookie: [...jar.values()].join('; ') } });
+    assert.equal(finished.status, 200, await finished.text());
+    assert.ok(finished.headers.get('Set-Cookie')!.startsWith(`${login.cookieName}=;`));
+    assert.match(finished.headers.get('Set-Cookie')!, /Max-Age=0/);
+    jar.delete(login.cookieName);
+    const row = await db.prepare('SELECT encrypted_refresh_token FROM credentials WHERE id = ?').bind(login.owner).first<{ encrypted_refresh_token: string }>();
+    assert.equal(await decrypt(row!.encrypted_refresh_token, Buffer.alloc(32, 1).toString('base64url'), login.owner), i === 1 ? 'test-refresh-b' : 'test-refresh');
+  }
+  assert.equal(await db.prepare('SELECT id FROM credentials WHERE id = ?').bind('discord:guild:999999999999999999').first(), null);
 });

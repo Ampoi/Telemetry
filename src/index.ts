@@ -8,8 +8,10 @@ import { collectorApi } from './collector-control';
 import { handleDiscord, consumeDiscordJobs, type DiscordJobEnvelope } from './discord';
 
 import { cloudApi } from './cloud/api';
-import { consume, scheduled } from './cloud/jobs';
+import { consume } from './cloud/jobs';
 import type { QueueJob } from './cloud/model';
+export { MeetingScheduler } from './meeting-scheduler';
+export { CollectionRecovery } from './cloud/recovery';
 
 interface Tab { tabProperties: { tabId: string; title: string }; childTabs?: Tab[] }
 async function route(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -50,7 +52,6 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
 }
 
 export default {
-  scheduled,
   async queue(batch: MessageBatch<DiscordJobEnvelope | QueueJob>, env: Env) {
     // Queue names may differ between local testing and a provisioned environment.
     const collection = batch.messages.every(m => 'kind' in m.body && m.body.kind === 'collection');
@@ -66,7 +67,7 @@ export default {
     response.headers.set('Cache-Control', 'no-store');
     response.headers.set('Referrer-Policy', 'no-referrer');
     response.headers.set('X-Content-Type-Options', 'nosniff');
-    response.headers.set('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'; base-uri 'none'");
+    if (!response.headers.has('Content-Security-Policy')) response.headers.set('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'; base-uri 'none'");
     return response;
   },
 } satisfies ExportedHandler<Env, DiscordJobEnvelope | QueueJob>;

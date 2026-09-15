@@ -6,6 +6,7 @@ import { discord } from './discord-rest';
 import { startScans } from './collection';
 import { dispatch } from './jobs';
 import { publish } from './store';
+import { ensureRecovery } from './recovery-wakeup';
 
 export async function status(env:Env,guild:string):Promise<unknown> {
   const settings=await env.DB.prepare('SELECT config,started FROM cloud_guilds WHERE guild=?').bind(guild).first();
@@ -68,6 +69,7 @@ export async function cloudApi(request:Request,env:Env):Promise<Response> {
   }
   if(path==='/scan' && request.method==='POST')return Response.json({accepted:true,tasks:await startScans(env,guild)},{status:202});
   if(path==='/retry-attachments' && request.method==='POST'){
+    await ensureRecovery(env,guild);
     await env.DB.batch([
       env.DB.prepare("UPDATE cloud_tasks SET status='pending',failures=0,due=0 WHERE guild=? AND kind='attachment' AND status='failed'").bind(guild),
       env.DB.prepare("UPDATE cloud_attachments SET status='pending',reason=NULL,retry_start=attempts WHERE guild=? AND status='failed'").bind(guild),
@@ -77,6 +79,7 @@ export async function cloudApi(request:Request,env:Env):Promise<Response> {
   if(path==='/exports' && request.method==='POST'){
     const body=await jsonBody(request);bounds(body.from,body.to);
     await status(env,guild);
+    await ensureRecovery(env,guild);
     const exportId=crypto.randomUUID();
     await env.DB.batch([
       env.DB.prepare('INSERT INTO cloud_exports(id,guild,from_date,to_date,created) VALUES(?,?,?,?,?)').bind(exportId,guild,body.from,body.to,Date.now()),

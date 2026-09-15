@@ -16,3 +16,6 @@ export default {
     }
   },
 };
+// Match the production bindings when Wrangler builds this test-only entrypoint.
+export { MeetingScheduler } from '../src/meeting-scheduler';
+export { CollectionRecovery } from '../src/cloud/recovery';

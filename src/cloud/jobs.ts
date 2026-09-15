@@ -1,31 +1,26 @@
 import { AppError } from '../errors';
 import { DiscordError } from './discord-rest';
-import { attachment, cleanup } from './media';
-import { scan, discover, verify, startScans } from './collection';
+import { attachment } from './media';
+import { scan, discover, verify } from './collection';
 import { exportPage } from './export';
 import { claim, enqueue, fence, publish } from './store';
 import type { QueueJob, Task } from './model';
+import { ensureRecovery } from './recovery-wakeup';
 
-export async function dispatch(env:Env):Promise<void> {
+export async function dispatch(env:Env,guild?:string):Promise<void> {
   const now=Date.now();
-  const pending=(await env.DB.prepare("SELECT id FROM cloud_tasks WHERE (status='pending' OR (status='running' AND lease_until<=?)) AND due<=? ORDER BY updated LIMIT 100").bind(now,now).all<{id:string}>()).results;
+  const pending=(await env.DB.prepare("SELECT id FROM cloud_tasks WHERE (status='pending' OR (status='running' AND lease_until<=?)) AND due<=?"+(guild?' AND guild=?':'')+" ORDER BY updated LIMIT 100").bind(now,now,...(guild?[guild]:[])).all<{id:string}>()).results;
   if(pending.length)await env.COLLECTION_JOBS.sendBatch(pending.map(row=>({body:{kind:'collection',id:row.id}})));
-  const media=(await env.DB.prepare("SELECT guild,id,channel,version FROM cloud_attachments WHERE status='pending' ORDER BY attempts,id LIMIT 50").all<{guild:string;id:string;channel:string;version:string}>()).results;
+  const media=(await env.DB.prepare("SELECT guild,id,channel,version FROM cloud_attachments WHERE status='pending'"+(guild?' AND guild=?':'')+" ORDER BY attempts,id LIMIT 50").bind(...(guild?[guild]:[])).all<{guild:string;id:string;channel:string;version:string}>()).results;
   for(const row of media)await enqueue(env,row.guild,row.channel,'attachment',{id:row.id,version:row.version},`attachment:${row.guild}:${row.id}:${row.version}`);
-}
-export async function scheduled(_event:ScheduledController,env:Env):Promise<void> {
-  if(env.COLLECTION_MODE!=='cloud')return;
-  // Recover the durable outbox before creating more work.
-  await dispatch(env);
-  const guilds=(await env.DB.prepare('SELECT guild FROM cloud_guilds ORDER BY guild').all<{guild:string}>()).results;
-  for(const {guild} of guilds)await startScans(env,guild);
-  await cleanup(env);
 }
 export async function consume(batch:MessageBatch<QueueJob>,env:Env):Promise<void> {
   for(const message of batch.messages){
     let task:Task|null=null;
     try {
       if(message.body.kind!=='collection' || typeof message.body.id!=='string'){message.ack();continue;}
+      const owner=await env.DB.prepare('SELECT guild FROM cloud_tasks WHERE id=?').bind(message.body.id).first<{guild:string}>();
+      if(owner)await ensureRecovery(env,owner.guild);
       task=await claim(env,message.body.id);
       if(!task){message.ack();continue;}
       if(task.kind==='scan')await scan(env,task);
@@ -49,7 +44,7 @@ export async function consume(batch:MessageBatch<QueueJob>,env:Env):Promise<void
       }
       if(failed && task.kind==='export')extra.push(fence(env,task,"UPDATE cloud_exports SET status='failed' WHERE id=? AND $FENCE",[task.id]));
       await env.DB.batch([...extra,fence(env,task,'UPDATE cloud_tasks SET status=?,failures=?,due=?,lease_until=0,error=?,updated=? WHERE id=? AND $FENCE',[failed?'failed':'pending',failures,Date.now()+delay*1000,safe,Date.now(),task.id])]);
-      // Persist the retry first; Cron recovers if this send fails or exceeds Queue delay limits.
+      // Persist the retry first; the guild alarm recovers if this send fails.
       if(!failed)await publish(env,task.id,Math.min(43200,delay));
       message.ack();
     }

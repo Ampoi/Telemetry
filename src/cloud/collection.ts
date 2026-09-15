@@ -2,10 +2,12 @@ import { AppError } from '../errors';
 import { discord, DiscordError } from './discord-rest';
 import { config, included, iso, snowflake, type Task, type Guild, type Channel, type RemoteChannel, type RemoteMessage } from './model';
 import { context, publish, fence, progress, saveMessage, tombstone } from './store';
+import { ensureRecovery } from './recovery-wakeup';
 
 export async function startScans(env: Env, guildId: string, days?: number, requestId?: string, ctx?: ExecutionContext): Promise<string[]> {
   const guild = await env.DB.prepare('SELECT * FROM cloud_guilds WHERE guild=?').bind(guildId).first<Guild>();
   if (!guild) throw new AppError(400, '先に管理CLIで収集対象を設定してください。');
+  await ensureRecovery(env,guildId);
   const cfg = config(JSON.parse(guild.config));
   const channels = (await env.DB.prepare('SELECT * FROM cloud_channels WHERE guild=?').bind(guildId).all<Channel>()).results;
   const now = Date.now(), runId = requestId ?? crypto.randomUUID();

@@ -6,8 +6,9 @@ import { documentId } from './template';
 import { cloudInteraction } from './cloud/api';
 import { acceptCollector } from './collector-control';
 import { guildOwner, requireGuildManager } from './discord-guild';
+import { meetingInteraction } from './meeting-discord';
 
-interface Interaction {
+export interface Interaction {
   id: string;
   application_id: string;
   type: number;
@@ -58,10 +59,11 @@ export async function handleDiscord(request: Request, env: Env, ctx: ExecutionCo
   try { interaction = JSON.parse(raw); } catch { throw new AppError(400, 'Invalid interaction JSON.'); }
   if (!interaction || interaction.application_id !== env.DISCORD_APPLICATION_ID) throw new AppError(401, 'Discord application mismatch.');
   if (interaction.type === 1) return Response.json({ type: 1 });
-  if (interaction.type !== 2) return ephemeral('対応しているコマンドは /auth・/document・/create・/telemetry です。');
+  if (interaction.type !== 2) return ephemeral('対応しているコマンドは /auth・/document・/create・/telemetry・/mtg です。');
   const userId = interaction.member?.user?.id ?? interaction.user?.id;
   if (!userId || !/^\d{17,20}$/.test(userId) || !/^\d{17,20}$/.test(interaction.id) || typeof interaction.token !== 'string' || !interaction.token) throw new AppError(400, 'Discord user or interaction missing.');
   try {
+    if (interaction.data?.name === 'mtg') return await meetingInteraction(interaction, env, ctx);
     if (interaction.data?.name === 'telemetry') return await (env.COLLECTION_MODE === 'cloud' ? cloudInteraction(interaction, env, ctx) : acceptCollector(interaction, env));
     if (!['auth', 'document', 'create'].includes(interaction.data?.name ?? '')) return ephemeral('対応しているコマンドは /auth・/document・/create・/telemetry です。');
     const guildId = requireGuildManager(interaction);

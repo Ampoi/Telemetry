@@ -1,6 +1,7 @@
 import { encrypt, hash, randomToken } from './crypto';
 import { AppError } from './errors';
 import { DOCS_SCOPE, exchangeToken } from './google';
+import { connectedPage } from './auth-page';
 
 export function appOrigin(env: Env): string {
   const url = new URL(env.APP_ORIGIN);
@@ -26,8 +27,21 @@ export async function startLogin(request: Request, env: Env): Promise<Response> 
   const ticket = new URL(request.url).searchParams.get('ticket') ?? '';
   const state = randomToken();
   const browser = randomToken();
-  const row = await env.DB.prepare("UPDATE auth_requests SET state_hash = ?, browser_hash = ?, status = 'authorizing' WHERE ticket_hash = ? AND status = 'pending' AND expires_at > ? RETURNING verifier")
+  let row = await env.DB.prepare("UPDATE auth_requests SET state_hash = ?, browser_hash = ?, status = 'authorizing' WHERE ticket_hash = ? AND status = 'pending' AND expires_at > ? RETURNING verifier")
     .bind(await hash(state), await hash(browser), await hash(ticket), Date.now()).first<{ verifier: string }>();
+  if (!row) {
+    const previous = await env.DB.prepare("SELECT state_hash, browser_hash FROM auth_requests WHERE ticket_hash = ? AND status = 'authorizing' AND expires_at > ?")
+      .bind(await hash(ticket), Date.now()).first<{ state_hash: string; browser_hash: string }>();
+    if (previous) {
+      const cookies = request.headers.get('Cookie')?.split(';').map(v => v.trim()) ?? [];
+      const prefix = `docs_oauth_${previous.state_hash}=`;
+      const proof = cookies.find(v => v.startsWith(prefix))?.slice(prefix.length);
+      if (proof && await hash(proof) === previous.browser_hash) {
+        row = await env.DB.prepare("UPDATE auth_requests SET state_hash = ?, browser_hash = ? WHERE ticket_hash = ? AND state_hash = ? AND status = 'authorizing' AND expires_at > ? RETURNING verifier")
+          .bind(await hash(state), await hash(browser), await hash(ticket), previous.state_hash, Date.now()).first<{ verifier: string }>();
+      }
+    }
+  }
   if (!row) throw new AppError(400, '認証URLは期限切れか使用済みです。/auth または pnpm demo auth を再実行してください。');
   const url = new URL('https://accounts.google.com/o/oauth2/v2/auth');
   url.search = new URLSearchParams({
@@ -38,18 +52,26 @@ export async function startLogin(request: Request, env: Env): Promise<Response> 
   }).toString();
   return new Response(null, { status: 302, headers: {
     Location: url.toString(),
-    'Set-Cookie': cookie(browser, env, 600),
+    'Set-Cookie': cookie(browser, env, 600, `docs_oauth_${await hash(state)}`),
   } });
 }
 
-function cookie(value: string, env: Env, age: number) {
-  return `docs_oauth=${value}; HttpOnly; SameSite=Lax; Path=/auth/callback; Max-Age=${age}${appOrigin(env).startsWith('https:') ? '; Secure' : ''}`;
+function cookie(value: string, env: Env, age: number, name: string) {
+  const path = name === 'docs_oauth' ? '/auth/callback' : '/auth';
+  return `${name}=${value}; HttpOnly; SameSite=Lax; Path=${path}; Max-Age=${age}${appOrigin(env).startsWith('https:') ? '; Secure' : ''}`;
 }
 
 export async function finishLogin(request: Request, env: Env): Promise<Response> {
   const params = new URL(request.url).searchParams;
-  const browser = request.headers.get('Cookie')?.split(';').map(v => v.trim()).find(v => v.startsWith('docs_oauth='))?.slice(11);
-  if (!browser || !params.get('state')) throw new AppError(400, '認証状態を確認できません。URLを開いた同じブラウザで認証してください。');
+  const state = params.get('state');
+  if (!state) throw new AppError(400, '認証状態を確認できません。URLを開いた同じブラウザで認証してください。');
+  // Each login needs its own cookie: another guild or CLI login may be open
+  // in the same browser. Accept the old name for logins started before rollout.
+  const cookies = request.headers.get('Cookie')?.split(';').map(v => v.trim()) ?? [];
+  const scopedName = `docs_oauth_${await hash(state)}`;
+  const cookieName = cookies.some(v => v.startsWith(`${scopedName}=`)) ? scopedName : 'docs_oauth';
+  const browser = cookies.find(v => v.startsWith(`${cookieName}=`))?.slice(cookieName.length + 1);
+  if (!browser) throw new AppError(400, '認証状態を確認できません。URLを開いた同じブラウザで認証してください。');
   const row = await env.DB.prepare("UPDATE auth_requests SET status = 'exchanging' WHERE state_hash = ? AND browser_hash = ? AND status = 'authorizing' AND expires_at > ? RETURNING id, verifier, owner")
     .bind(await hash(params.get('state')!), await hash(browser), Date.now()).first<{ id: string; verifier: string; owner: string }>();
   if (!row) throw new AppError(400, '認証状態が無効・期限切れ・使用済みです。/auth または pnpm demo auth を再実行してください。');
@@ -70,8 +92,12 @@ export async function finishLogin(request: Request, env: Env): Promise<Response>
         .bind(row.owner, await encrypt(tokens.refresh_token, env.TOKEN_ENCRYPTION_KEY, row.owner), Date.now()),
       env.DB.prepare("UPDATE auth_requests SET status = 'complete', verifier = '' WHERE id = ?").bind(row.id),
     ]);
-    return new Response('<!doctype html><html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Google認証完了</title><body><h1>Googleドキュメントに接続しました</h1><p>このタブを閉じてDiscordまたはターミナルに戻ってください。Discordでは認証を開始したサーバー専用の接続です。/document document:ドキュメントURL で保存先を設定し、/create でタブを作成できます。</p></body></html>', {
-      headers: { 'Content-Type': 'text/html; charset=utf-8', 'Set-Cookie': cookie('', env, 0) },
+    const nonce = randomToken();
+    return new Response(connectedPage(row.owner, nonce), {
+      headers: {
+        'Content-Type': 'text/html; charset=utf-8', 'Set-Cookie': cookie('', env, 0, cookieName),
+        'Content-Security-Policy': `default-src 'none'; style-src 'nonce-${nonce}'; frame-ancestors 'none'; base-uri 'none'`,
+      },
     });
   } catch (error) {
     await env.DB.prepare("UPDATE auth_requests SET status = 'failed', verifier = '' WHERE id = ?").bind(row.id).run();

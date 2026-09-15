@@ -29,7 +29,12 @@
       { "queue": "telemetry-collection", "max_batch_size": 1, "max_batch_timeout": 1, "max_retries": 5, "max_concurrency": 2 }
     ]
   },
-  "triggers": { "crons": ["*/5 * * * *"] },
+  "durable_objects": { "bindings": [
+    { "name": "MEETINGS", "class_name": "MeetingScheduler" },
+    { "name": "COLLECTION_RECOVERY", "class_name": "CollectionRecovery" }
+  ] },
+  "migrations": [{ "tag": "v1-meeting-alarms", "new_sqlite_classes": ["MeetingScheduler", "CollectionRecovery"] }],
+  "triggers": { "crons": [] },
   // OAuth query strings and credentials must not appear in invocation logs.
   "observability": { "enabled": false }
 }

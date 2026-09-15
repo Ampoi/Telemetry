@@ -82,7 +82,7 @@ export async function attachment(env:Env,task:Task):Promise<void> {
   ]);
   await progress(env,task,p,true);
 }
-export async function cleanup(env:Env):Promise<void> {
-  const rows=(await env.DB.prepare('SELECT storage_key FROM cloud_cleanup WHERE due<=? LIMIT 50').bind(Date.now()).all<{storage_key:string}>()).results;
+export async function cleanup(env:Env,guild?:string):Promise<void> {
+  const rows=(await env.DB.prepare('SELECT storage_key FROM cloud_cleanup WHERE due<=?'+(guild?' AND storage_key LIKE ?':'')+' LIMIT 50').bind(Date.now(),...(guild?[`guild/${guild}/%`]:[])).all<{storage_key:string}>()).results;
   for(const row of rows){await env.MEDIA.delete(row.storage_key);await env.DB.prepare('DELETE FROM cloud_cleanup WHERE storage_key=? AND due<=?').bind(row.storage_key,Date.now()).run();}
 }
